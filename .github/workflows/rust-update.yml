@@ -790,9 +790,11 @@ jobs:
           # main.)
           # The rules list is paginated; --paginate --slurp gathers every
           # page into one array of pages, so a rule past page one cannot
-          # read as "policy absent".
+          # read as "policy absent". --slurp cannot combine with --jq (gh
+          # rejects the pair outright), so the query is a separate jq
+          # invocation.
           strict=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
-            --jq '[.[][] | select(.type == "required_status_checks")
+            | jq '[.[][] | select(.type == "required_status_checks")
                          | .parameters.strict_required_status_checks_policy] | any') || strict=false
           if [ "$PASSED" = 'true' ] && [ "$strict" = 'true' ]; then
             # Any stale arming was cleared right after the PR was
