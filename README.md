@@ -115,9 +115,20 @@ Inputs (all optional): `lockfile` (default `Cargo.lock`; it must name a
 directory, default `cargo test --locked`), `commit-prefix` (default empty —
 a bare subject; consumers whose commit conventions prefix non-behavior
 changes set it), and `ci-workflow` (default empty — disabled) — a consumer
-workflow dispatched against the pushed branch, needed because a PR opened by
-`GITHUB_TOKEN` triggers no `on: pull_request` workflows. It must carry
-`workflow_dispatch` with a `pr` input on the consumer's default branch.
+workflow dispatched against the pushed branch. A pull request opened under
+GITHUB_TOKEN's identity DOES trigger a consumer's own `on: pull_request`
+workflows, same as any other, but GitHub gates that run pending manual
+approval, since that identity is not a repository collaborator; dispatch
+sidesteps the gate. It must carry `workflow_dispatch` with a `pr` input on
+the consumer's default branch.
+
+Two optional secrets, `app-id` and `app-private-key`, let a consumer supply
+a GitHub App installation instead of GITHUB_TOKEN — an App installation IS a
+collaborator, so the pull requests it opens never hit the approval gate in
+the first place, and `ci-workflow` becomes unnecessary. See
+[`docs/GITHUB_APP.md`](docs/GITHUB_APP.md) for the one-time setup. Providing
+one secret without the other is refused: a partial credential mints no
+token.
 
 What a consumer must already have: a committed `Cargo.lock`, `target/` in
 `.gitignore` (the tree check refuses anything else the build drops in the
