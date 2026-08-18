@@ -60,6 +60,13 @@ Recorded at creation (2026-08-18) so they get a human look:
 
 ## Review and merge gates
 
+- [ ] Wire `docs/GITHUB_APP.md`'s setup into the workflow itself: an
+      optional `app-id` / `app-private-key` pair on `workflow_call`'s
+      `secrets:`, minting a short-lived installation token in the publish
+      job when a consumer supplies them, in place of `github.token`. Until
+      this lands, `root` and `mesh` (both App-installed already) keep
+      seeing the first-time-contributor approval prompt on `ci.yml`'s own
+      `pull_request` runs that this document explains.
 - [ ] Add `codex-review-check.yml` (mikelward/codex-review's consumer
       check): Codex reviews run here, but nothing verifies the workflow
       pin the ruleset should require.
