@@ -60,13 +60,14 @@ Recorded at creation (2026-08-18) so they get a human look:
 
 ## Review and merge gates
 
-- [ ] Wire `docs/GITHUB_APP.md`'s setup into the workflow itself: an
-      optional `app-id` / `app-private-key` pair on `workflow_call`'s
-      `secrets:`, minting a short-lived installation token in the publish
-      job when a consumer supplies them, in place of `github.token`. Until
-      this lands, `root` and `mesh` (both App-installed already) keep
-      seeing the first-time-contributor approval prompt on `ci.yml`'s own
-      `pull_request` runs that this document explains.
+- [ ] **Decide whether to pin `actions/create-github-app-token` by SHA**,
+      matching every other third-party action in `rust-update.yml`
+      (`actions/checkout`, `actions/upload-artifact`,
+      `actions/download-artifact`). Left on `@v2` for now — the repo owner
+      is undecided. Worth weighing seriously rather than deferred by
+      default: this is the one action in the file that handles a private
+      key and mints a write-scoped token, arguably the most sensitive thing
+      here to leave unpinned.
 - [ ] Add `codex-review-check.yml` (mikelward/codex-review's consumer
       check): Codex reviews run here, but nothing verifies the workflow
       pin the ruleset should require.
@@ -77,7 +78,7 @@ Recorded at creation (2026-08-18) so they get a human look:
 
 ## Consumers
 
-- [ ] Wire up `root` first (smallest dependency set, and the setuid binary
-      is where the cooldown earns the most): caller workflow, plus
-      `workflow_dispatch` with a `pr` input on its CI if it wants the
-      dispatch. Then `mesh`, after a week of watching root's runs.
+- [x] `root` and `mesh` are both wired up (`root` also gained its first
+      `ci.yml` in the same pass). Live shakedown surfaced the
+      first-time-contributor approval gate `docs/GITHUB_APP.md` and this
+      file's App-token support address.

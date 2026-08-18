@@ -69,11 +69,8 @@ run was clicked "approve" and trusting it forever after.
 
 ## What the consumer's caller workflow passes
 
-Once `rust-update.yml` accepts these as a `secrets:` block on
-`workflow_call` (tracked in `TODO.md`; not yet wired as of this writing —
-until it lands, the publish job keeps using `github.token` and consumers see
-the approval prompt this document describes), a consumer opts in by passing
-them through:
+`rust-update.yml` accepts these as a `secrets:` block on `workflow_call`. A
+consumer opts in by passing them through:
 
 ```yaml
 jobs:
