@@ -1,5 +1,21 @@
 # TODO
 
+## Reconsider later
+
+- **`docs/PAT.md`'s personal access token is the currently used path for
+  authoring the weekly PR, not `docs/GITHUB_APP.md`'s GitHub App** (repo
+  owner decision, 2026-08-19, mirrored in `gradle-update`): simpler
+  one-time setup while every consumer (`root`, `mesh`) is single-owner, at
+  the cost of a broader-blast-radius credential tied to a real user account
+  rather than the App's narrower, independently revocable, per-repo
+  installation. **Switch back once a consumer repository takes external
+  contributions** — a PAT's blast radius matters more once people other than
+  the owner have any access to the repository or its Actions logs.
+  Reversible without a workflow change: both paths are already wired into
+  `rust-update.yml` (`token` takes priority over `app-id`/`app-private-key`
+  if both are set), so reverting is re-pointing a consumer's `secrets:`
+  block, not touching the reusable workflow.
+
 ## Decisions needing review
 
 Recorded at creation (2026-08-18) so they get a human look:
@@ -59,11 +75,12 @@ Recorded at creation (2026-08-18) so they get a human look:
   not yet run end-to-end here; the first consumer runs are the shakedown.
 - **Codex didn't auto-review the first App-opened PR** (mesh#533; fixed
   2026-08-19). The "Open the pull request" step now posts `@codex review`
-  itself whenever this run opened the PR under the App (`app_opened_pr`) —
-  harmless if Codex already reacted on its own, and cheap insurance against
-  a required `codex` status that otherwise never gets set. Based on one
-  data point, not a confirmed root cause; port to `gradle-update.yml` if
-  that hub sees the same gap once it grows App-token support.
+  itself whenever this run opened the PR under a non-default identity
+  (`nondefault_opened_pr` — a PAT or a minted App token; the same nudge now
+  also covers a PAT-opened PR, unconfirmed to have the same gap but cheap
+  insurance either way). Harmless if Codex already reacted on its own. Based
+  on one data point, not a confirmed root cause; `gradle-update.yml` already
+  carries the same nudge, ported alongside PAT support.
 
 ## Review and merge gates
 
