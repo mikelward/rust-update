@@ -73,6 +73,13 @@ Recorded at creation (2026-08-18) so they get a human look:
 - **The publish-path branch logic** (adoption, supersession, auto-merge
   arming with the strict-policy probe) is ported from gradle-update but has
   not yet run end-to-end here; the first consumer runs are the shakedown.
+  One gap already caught by inspection while adding PAT support
+  (2026-08-19): the strict-policy probe read the ambient, PAT/App-preferring
+  `GH_TOKEN` instead of overriding to `$DEFAULT_TOKEN` the way the other
+  Actions-API reads in this job do — neither credential's documented
+  permissions cover `rules/branches`, so this would have failed under
+  `set -e` for any consumer with either wired up. Fixed; the rest of this
+  entry stands.
 - **Codex didn't auto-review the first App-opened PR** (mesh#533; fixed
   2026-08-19). The "Open the pull request" step now posts `@codex review`
   itself whenever this run opened the PR under a non-default identity
