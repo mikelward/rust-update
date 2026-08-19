@@ -98,3 +98,21 @@ test("the CI dispatch and its PR-body claim key off app_opened_pr, not the raw A
     "app_opened_pr's derivation must require adopt != true or pr_opened_here, not APP_TOKEN_USED by itself",
   );
 });
+
+test("an App-opened PR gets an explicit @codex review nudge, retried like the body edit", () => {
+  // mesh#533, the first PR this workflow opened under the App's identity,
+  // got no automatic Codex review — the connector's webhook trigger
+  // apparently doesn't fire the same way it does for a human or
+  // GITHUB_TOKEN-authored PR. A required `codex` status that never gets
+  // set would otherwise leave the PR silently stuck. Gated on
+  // app_opened_pr, not unconditional: there's no evidence of the gap for
+  // the non-App path, and nudging every PR would just be noise.
+  //
+  // Retried: a rerun of a failed attempt doesn't get a second chance at
+  // this block (a later rerun adopts the existing PR, and app_opened_pr
+  // goes false with it), so a transient gh pr comment failure without a
+  // retry here would strand the PR with no automatic recovery path — a
+  // Codex finding on the PR that added this nudge (mikelward/rust-update#6).
+  const nudge = /if \[ "\$app_opened_pr" = 'true' \]; then\s*\n\s*nudged=false\s*\n\s*for _ in 1 2 3; do\s*\n\s*if gh pr comment "\$pr" --body '@codex review'; then/;
+  assert.match(workflow, nudge, "the retried @codex review nudge, gated on app_opened_pr, was not found");
+});
