@@ -116,3 +116,20 @@ test("an App-opened PR gets an explicit @codex review nudge, retried like the bo
   const nudge = /if \[ "\$app_opened_pr" = 'true' \]; then\s*\n\s*nudged=false\s*\n\s*for _ in 1 2 3; do\s*\n\s*if gh pr comment "\$pr" --body '@codex review'; then/;
   assert.match(workflow, nudge, "the retried @codex review nudge, gated on app_opened_pr, was not found");
 });
+
+test("the workflow declares an explicit empty top-level permissions block", () => {
+  // Every job already declares its own downscoped permissions, so this
+  // line grants nothing to any job that has one — but if it were removed
+  // or moved below `jobs:`, a job added later without its own block would
+  // silently inherit whatever the calling job granted instead of getting
+  // no ambient token. Anchored to appear before `jobs:` so a regression
+  // that re-adds it in the wrong place still fails this.
+  const jobsIndex = workflow.indexOf("\njobs:");
+  assert.notEqual(jobsIndex, -1, "the `jobs:` delimiter was not found in the workflow");
+  const beforeJobs = workflow.slice(0, jobsIndex);
+  assert.match(
+    beforeJobs,
+    /^permissions: \{\}$/m,
+    "the top-level `permissions: {}` fallback was not found before `jobs:`",
+  );
+});

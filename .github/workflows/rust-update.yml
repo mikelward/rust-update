@@ -89,10 +89,12 @@ on:
         description: The App's private key (the full .pem contents), paired with app-id.
         required: false
 
-# No permissions here: the CALLER grants them (contents: write,
-# pull-requests: write, actions: write), and each job below downscopes. The
-# job that runs unreviewed dependency code gets a read-only token; only the
-# publish job, which runs none, can write.
+# Explicitly empty, not omitted: the CALLER grants the real permissions
+# (contents: write, pull-requests: write, actions: write) and every job below
+# declares its own downscoped block, so this line grants nothing itself — it
+# exists so a future job that forgets its own block gets no ambient token
+# instead of silently inheriting whatever the caller happened to grant.
+permissions: {}
 
 jobs:
   # Rewrites the lockfile and runs the checks. Compiling executes
