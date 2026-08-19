@@ -973,8 +973,13 @@ jobs:
           # page into one array of pages, so a rule past page one cannot
           # read as "policy absent". --slurp cannot combine with --jq (gh
           # rejects the pair outright), so the query is a separate jq
-          # invocation.
-          strict=$(gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
+          # invocation. GH_TOKEN overridden to $DEFAULT_TOKEN here too, same
+          # as the Actions-API sites above: this is a read no write is
+          # riding on, and neither docs/PAT.md's nor docs/GITHUB_APP.md's
+          # credential is asked to cover it — a third permission
+          # (Administration: read) just for this one diagnostic query isn't
+          # worth the extra grant.
+          strict=$(GH_TOKEN="$DEFAULT_TOKEN" gh api --paginate --slurp "repos/${GITHUB_REPOSITORY}/rules/branches/$(printf %s "$DEFAULT_BRANCH" | jq -sRr @uri)" \
             | jq '[.[][] | select(.type == "required_status_checks")
                          | .parameters.strict_required_status_checks_policy] | any') || strict=false
           if [ "$PASSED" = 'true' ] && [ "$strict" = 'true' ]; then

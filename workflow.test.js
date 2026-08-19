@@ -15,13 +15,26 @@ test("the strict-policy probe pipes --slurp's output into a separate jq, never c
   // the run just falls back to a manual merge, so nothing red ever reports
   // it. First assert the probe was actually found, so this test fails
   // loudly if the line moves or is reworded rather than passing vacuously.
-  const probe = /strict=\$\(gh api --paginate --slurp [^\n]*\\\n\s*\|\s*jq /;
+  const probe = /strict=\$\(GH_TOKEN="\$DEFAULT_TOKEN" gh api --paginate --slurp [^\n]*\\\n\s*\|\s*jq /;
   assert.match(workflow, probe, "the strict-policy probe's gh api | jq pipeline was not found");
 
   // The specific regression: --jq attached directly to the same `gh api`
   // invocation that also carries --slurp.
   const combined = /gh api[^\n]*--slurp[^\n]*--jq|gh api[^\n]*--jq[^\n]*--slurp/;
   assert.doesNotMatch(workflow, combined, "--slurp and --jq must not appear on the same gh api invocation");
+});
+
+test("the strict-policy probe overrides GH_TOKEN to github.token, never the PAT/App-preferring one", () => {
+  // Ported from gradle-update but had not run end-to-end here (TODO.md
+  // "Known gaps") — this probe was still reading the ambient, PAT/App-
+  // preferring $GH_TOKEN, which would fail under set -e for any consumer
+  // that wired up either credential (neither docs/PAT.md's nor
+  // docs/GITHUB_APP.md's permissions cover Administration:read).
+  assert.match(
+    workflow,
+    /strict=\$\(GH_TOKEN="\$DEFAULT_TOKEN" gh api --paginate --slurp/,
+    "the strict-policy probe must override GH_TOKEN to $DEFAULT_TOKEN",
+  );
 });
 
 test("a half-supplied App credential is refused through env, never secrets, in its if:, but only when no PAT is set", () => {
