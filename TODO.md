@@ -57,6 +57,13 @@ Recorded at creation (2026-08-18) so they get a human look:
 - **The publish-path branch logic** (adoption, supersession, auto-merge
   arming with the strict-policy probe) is ported from gradle-update but has
   not yet run end-to-end here; the first consumer runs are the shakedown.
+- **Codex didn't auto-review the first App-opened PR** (mesh#533; fixed
+  2026-08-19). The "Open the pull request" step now posts `@codex review`
+  itself whenever this run opened the PR under the App (`app_opened_pr`) —
+  harmless if Codex already reacted on its own, and cheap insurance against
+  a required `codex` status that otherwise never gets set. Based on one
+  data point, not a confirmed root cause; port to `gradle-update.yml` if
+  that hub sees the same gap once it grows App-token support.
 
 ## Review and merge gates
 
@@ -75,7 +82,6 @@ Recorded at creation (2026-08-18) so they get a human look:
       default branch requiring the CI gate, the `codex` status,
       conversation resolution and up-to-date branches, and the auto-merge
       setting enabled.
-
 ## Consumers
 
 - [x] `root` and `mesh` are both wired up (`root` also gained its first

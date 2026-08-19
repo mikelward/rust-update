@@ -874,6 +874,35 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          # mesh#533, the first PR this workflow ever opened under the
+          # App's identity, got no automatic Codex review — the connector's
+          # webhook trigger apparently doesn't fire for an App-authored PR
+          # the way it does for a human or GITHUB_TOKEN one. A required
+          # `codex` status that never gets set leaves the PR silently stuck
+          # until someone notices, which defeats the point of the merge
+          # gate, so nudge it explicitly whenever this run opened the PR
+          # under the App. Retried like the body edit above: a rerun of
+          # THIS attempt doesn't get another chance, since a later rerun
+          # adopts the existing PR (adopt=true, pr_opened_here=false) and
+          # app_opened_pr goes false with it — so a nudge that never leaves
+          # this loop is not recoverable except by a human noticing and
+          # commenting manually. Harmless if Codex reacts on its own first
+          # either way — the nudge just asks for a second look.
+          if [ "$app_opened_pr" = 'true' ]; then
+            nudged=false
+            for _ in 1 2 3; do
+              if gh pr comment "$pr" --body '@codex review'; then
+                nudged=true
+                break
+              fi
+              sleep 5
+            done
+            if [ "$nudged" != true ]; then
+              echo "Could not post the @codex review nudge on #$pr after 3 attempts — it needs a manual \`@codex review\` comment." \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
           # Arm auto-merge so a clean batch lands unattended; the ruleset's
           # required checks do the reviewing. ONLY when this run's own
           # checks passed: auto-merge waits for the ruleset's requirements,
