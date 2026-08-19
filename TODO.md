@@ -75,7 +75,7 @@ Recorded at creation (2026-08-18) so they get a human look:
       default: this is the one action in the file that handles a private
       key and mints a write-scoped token, arguably the most sensitive thing
       here to leave unpinned.
-- [ ] Add `codex-review-check.yml` (mikelward/codex-review's consumer
+- [x] Add `codex-review-check.yml` (mikelward/codex-review's consumer
       check): Codex reviews run here, but nothing verifies the workflow
       pin the ruleset should require.
 - [ ] Verify the settings half of the fleet's bar: a ruleset on the
