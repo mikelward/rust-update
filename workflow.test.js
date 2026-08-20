@@ -4,7 +4,10 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, mkdtempSync, mkdirSync, writeFileSync, chmodSync, rmSync, readdirSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const workflow = readFileSync(".github/workflows/rust-update.yml", "utf8");
 
@@ -175,4 +178,237 @@ test("the workflow declares an explicit empty top-level permissions block", () =
     /^permissions: \{\}$/m,
     "the top-level `permissions: {}` fallback was not found before `jobs:`",
   );
+});
+
+// The tree check (the "Verify only the lockfile changed" step's unexpected/
+// planted computation) reads `git status --porcelain -z` through a direct
+// pipe under `lastpipe`, classifying each whole NUL-terminated record. This
+// guards against three bugs earlier forms had: a `tr '\0' '\n'` conversion
+// let an untracked filename with an embedded newline split into two lines
+// and hide behind an allowlist entry (verified directly: a file named
+// "\nXXXchecks.md" vanished completely under that pipeline, `unexpected`
+// coming back empty even though the file was there); a trailing `|| true`
+// swallowed a genuine `git status` failure the same way it swallowed
+// grep's ordinary no-matches exit 1; and — the reason this is a pipe and
+// not a temp file, per Codex's review of the interim mktemp fix — reading
+// a scratch file back by NAME reopens a window between the write and the
+// read for anything already watching $RUNNER_TEMP to swap its content,
+// which mktemp's unpredictable name narrows but does not close. Ported
+// from the identical fix applied to mikelward/gradle-update and
+// mikelward/npm-update (whose simpler shape doesn't need the pipe form,
+// since capture_and_restore there re-reads a list across two separate
+// loops with real work between them — this workflow has no such step).
+test("the tree check reads NUL-terminated records through a direct pipe, not a tr-joined `|| true` pipe or a scratch file", () => {
+  const riskyJoin = /git status --porcelain[^\n]*\\\n[^\n]*\| tr '\\\\0'/;
+  assert.doesNotMatch(workflow, riskyJoin, "a git-status-into-tr pipeline reappeared — see the rust-update-nul-safety fix");
+  assert.doesNotMatch(workflow, /_z=\$\(mktemp/, "a scratch-file variable reappeared — see the direct-pipe fix");
+
+  const readLoops = [...workflow.matchAll(/while IFS= read -r -d '' entry; do/g)];
+  assert.equal(readLoops.length, 2, `expected 2 NUL-record read loops, found ${readLoops.length}`);
+});
+
+// Extracts the tree-check block from the real file text (not a hand-copied
+// literal) so a future edit that reintroduces either bug, or removes the
+// fix, breaks this test rather than drifting unnoticed.
+function extractTreeCheckBlock(text) {
+  const startMarker = 'allow=("$LOCKFILE" checks.md deps-stat.txt report.md)';
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "tree-check block start marker not found in rust-update.yml");
+  const plantedIfMarker = 'if [ -n "$planted" ]; then';
+  const plantedIfStart = text.indexOf(plantedIfMarker, start);
+  assert.notEqual(plantedIfStart, -1, "tree-check block's planted-check if not found");
+  const fiEnd = text.indexOf("\n          fi\n", plantedIfStart);
+  assert.notEqual(fiEnd, -1, "tree-check block's closing fi not found");
+  const raw = text.slice(start, fiEnd + "\n          fi".length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+const treeCheckBlock = extractTreeCheckBlock(workflow);
+
+function runTreeCheckBlock(repoDir, runnerTemp, lockfile, extraPath = "") {
+  // shopt -s lastpipe first: the extracted block relies on it (the tree
+  // check's own `run:` script sets it before `set -euo pipefail`, one line
+  // above where this extraction starts).
+  const script = `shopt -s lastpipe\nset -euo pipefail\ncd "$1"\nLOCKFILE="$2"\nRUNNER_TEMP="$3"\n${treeCheckBlock}\necho OK\n`;
+  const env = { ...process.env, PATH: `${extraPath}${extraPath ? ":" : ""}${process.env.PATH}` };
+  return execFileSync("bash", ["-c", script, "bash", repoDir, lockfile, runnerTemp], { encoding: "utf8", env });
+}
+
+function initRepo(dir) {
+  mkdirSync(dir, { recursive: true });
+  const git = (...args) => execFileSync("git", args, { cwd: dir });
+  git("init", "-q");
+  git("config", "user.email", "test@example.com");
+  git("config", "user.name", "test");
+  writeFileSync(join(dir, "Cargo.lock"), "x");
+  writeFileSync(join(dir, "checks.md"), "x");
+  writeFileSync(join(dir, "deps-stat.txt"), "x");
+  writeFileSync(join(dir, "report.md"), "x");
+  git("add", "Cargo.lock", "checks.md", "deps-stat.txt", "report.md");
+  git("commit", "-q", "-m", "init");
+}
+
+test("the tree check passes on a clean tree", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-treecheck-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const out = runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock");
+    assert.match(out, /OK/);
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("the tree check catches an untracked file whose name hides a second record behind an embedded newline", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-treecheck-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    writeFileSync(join(repoDir, "\nXXXchecks.md"), "x");
+    assert.throws(
+      () => runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock"),
+      /The batch touched files outside the lockfile/,
+      "the adversarial untracked file was not detected — the NUL-safety fix regressed",
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("the tree check fails closed when git status itself fails, instead of the trailing `|| true` swallowing it", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-treecheck-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  const binDir = mkdtempSync(join(tmpdir(), "rust-update-fakegit-"));
+  try {
+    initRepo(repoDir);
+    const realGit = execFileSync("command", ["-v", "git"], { shell: "/bin/bash", encoding: "utf8" }).trim();
+    const shim = `#!/bin/sh\nif [ "$1" = status ]; then echo "fatal: fake git status failure" >&2; exit 128; fi\nexec "${realGit}" "$@"\n`;
+    const shimPath = join(binDir, "git");
+    writeFileSync(shimPath, shim);
+    chmodSync(shimPath, 0o755);
+    assert.throws(
+      () => runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock", binDir),
+      (err) => {
+        assert.notEqual(err.status, 0, "a fake git-status failure did not stop the script — the status-swallow fix regressed");
+        assert.doesNotMatch(err.stdout?.toString() ?? "", /OK/, "the script reached its success echo despite git status failing");
+        return true;
+      },
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+    rmSync(binDir, { recursive: true, force: true });
+  }
+});
+
+// Codex found two rounds on this check: first that the original fixed
+// scratch-file names were predictable (fixed with mktemp), then that even
+// an unpredictable mktemp'd name is reopened by pathname for reading a
+// moment after git status writes it — a window a process already running
+// and watching $RUNNER_TEMP (left behind by a build script from the checks
+// above) could in principle win, discovering the name the instant mktemp
+// creates it and swapping the content before the read loop opens it. The
+// real fix is structural, not another mktemp variant: a direct pipe has no
+// name on disk at all for anything to discover. `shopt -s lastpipe` keeps
+// the read loop in the CURRENT shell (so its variables survive past the
+// pipe) rather than a subshell, and `pipefail` still catches a genuine git
+// status failure the same way the temp-file form's bare command did.
+test("both tree checks use a direct pipe under lastpipe, not a scratch file", () => {
+  assert.match(workflow, /^\s*shopt -s lastpipe\s*$/m, "shopt -s lastpipe was not found ahead of the tree-check step's set -euo pipefail");
+  assert.doesNotMatch(workflow, /_z=\$\(mktemp/, "a scratch-file variable reappeared — the tree checks should pipe directly, not write to a temp file");
+
+  const pipes = [...workflow.matchAll(/git status --porcelain -z [^\n|]*\| while IFS= read -r -d '' entry; do/g)];
+  assert.equal(pipes.length, 2, `expected 2 direct git-status-into-while pipes (unexpected, planted), found ${pipes.length}`);
+});
+
+test("no scratch file is left in $RUNNER_TEMP by either tree check, on a clean pass or a detected one", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-nofile-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock");
+    assert.deepEqual(readdirSync(runnerTemp), [], "the clean-pass run left a file behind in $RUNNER_TEMP");
+    writeFileSync(join(repoDir, "evil-untracked-file.txt"), "x");
+    try {
+      runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock");
+    } catch {
+      // Expected — the check exits 1 on the untracked file. What matters
+      // here is only that it still left nothing behind to race against.
+    }
+    assert.deepEqual(readdirSync(runnerTemp), [], "the detecting run left a file behind in $RUNNER_TEMP");
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+// A false pipefail trip Codex found on review of the direct-pipe fix
+// above: the loop's per-record `[ "$keep" -eq 1 ] && var="$var$path"\n`
+// used the LAST record's own test as the loop's own exit status once the
+// git-status pipe made it part of a pipeline — an ALLOWLISTED record
+// (keep=0, the common case: every normal run's own modified lockfile and
+// report files) makes that `[ ]` test false, so under `pipefail` the whole
+// pipe — and the step, under `set -e` — would exit nonzero on every
+// ordinary run, even with nothing actually wrong. Verified directly:
+// `shopt -s lastpipe; set -eo pipefail; printf 'a\0' | while IFS= read -r
+// -d '' e; do [ 0 -eq 1 ] && x=1; done; echo unreached` never reaches
+// "unreached". Fixed with `if`/`fi` (always exits 0 when its condition is
+// false), not `[ ... ] &&`.
+test("a normal run with only allowlisted changes does not abort the tree check", () => {
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-allowlisted-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    // The two ordinary things a real batch changes: the lockfile itself,
+    // and the report the "Run the checks" step already wrote.
+    writeFileSync(join(repoDir, "Cargo.lock"), "y");
+    writeFileSync(join(repoDir, "checks.md"), "y");
+    const out = runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock");
+    assert.match(out, /OK/, "a run with only allowlisted changes aborted instead of passing");
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
+});
+
+test("--no-renames is present on both git status -z invocations", () => {
+  const calls = [...workflow.matchAll(/git status --porcelain -z [^\n|]*\|/g)].map((m) => m[0]);
+  assert.equal(calls.length, 2, `expected 2 git status -z invocations, found ${calls.length}`);
+  for (const call of calls) {
+    assert.match(call, /--no-renames/, `git status -z call missing --no-renames: ${call}`);
+  }
+});
+
+test("a staged rename onto an allowlisted destination doesn't hide the source path going missing", () => {
+  // Without --no-renames, `git status --porcelain -z` on a staged rename
+  // emits the destination as a normal "XY path" record and the SOURCE as a
+  // bare path with no status prefix at all — this loop's `${entry:3}`
+  // strips the first 3 bytes of every record uniformly, so on that second,
+  // prefix-less field it eats 3 bytes of the real old path instead. Picking
+  // an old path whose first 3 bytes are exactly what's needed to land the
+  // corrupted result on the allowlist (here: renaming "XXXchecks.md" onto
+  // "checks.md" corrupts the old-path field into "checks.md" too) makes the
+  // rename disappear from `unexpected` entirely. Codex found this on review
+  // of the direct-pipe fix.
+  const repoDir = mkdtempSync(join(tmpdir(), "rust-update-rename-"));
+  const runnerTemp = mkdtempSync(join(tmpdir(), "rust-update-runnertemp-"));
+  try {
+    initRepo(repoDir);
+    const git = (...args) => execFileSync("git", args, { cwd: repoDir });
+    writeFileSync(join(repoDir, "XXXchecks.md"), "some content long enough for git to treat this as a rename rather than an add+delete pair");
+    git("add", "XXXchecks.md");
+    git("commit", "-q", "-m", "add XXXchecks.md");
+    git("mv", "-f", "XXXchecks.md", "checks.md");
+    assert.throws(
+      () => runTreeCheckBlock(repoDir, runnerTemp, "Cargo.lock"),
+      /The batch touched files outside the lockfile/,
+      "a staged rename was not detected — the source path (XXXchecks.md) went missing without --no-renames",
+    );
+  } finally {
+    rmSync(repoDir, { recursive: true, force: true });
+    rmSync(runnerTemp, { recursive: true, force: true });
+  }
 });
