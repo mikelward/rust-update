@@ -327,6 +327,7 @@ jobs:
           LOCKFILE: ${{ inputs.lockfile }}
           LOCKFILE_SHA: ${{ steps.changed.outputs.lockfile_sha }}
         run: |
+          shopt -s lastpipe
           set -euo pipefail
           # `git status`, not `git diff`: diff only sees tracked changes, so
           # an untracked file dropped into the tree by a build script would
@@ -338,10 +339,61 @@ jobs:
           # git emits paths raw: its C-quoting of spaces and non-ASCII would
           # otherwise never equal the literal $LOCKFILE and fail every
           # publication under such a path.
-          unexpected=$(git status --porcelain -z --untracked-files=all \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | sed 's/^...//' \
-            | grep -Fxv -e "$LOCKFILE" -e checks.md -e deps-stat.txt -e report.md || true)
+          # A PIPE, not a scratch file: no name on disk for anything
+          # watching $RUNNER_TEMP (a daemonized process a build script left
+          # running from the checks above) to discover and swap the content
+          # of between this git status and the read loop opening it — the
+          # earlier mktemp fix closed the PREDICTABLE-name version of that
+          # attack, but not this one, since mktemp's own file is still
+          # reopened by name for reading a moment later (Codex, on review
+          # of the mktemp fix). `shopt -s lastpipe` keeps the loop below in
+          # THIS shell rather than a subshell, so $unexpected set inside it
+          # survives past the pipe — verified directly
+          # (`shopt -s lastpipe; printf 'a\nb\n' | while read -r l; do
+          # out="$out$l,"; done; echo "$out"` prints "a,b,", not empty).
+          # `pipefail` still catches a genuine git-status failure the same
+          # way the temp-file form's bare command did — verified directly
+          # (`shopt -s lastpipe; set -eo pipefail; false | while read l; do
+          # :; done; echo unreached` never reaches "unreached").
+          # `--no-renames`: without it, a staged rename's -z record is TWO
+          # NUL-delimited fields for one change — "XY newpath", then a bare
+          # "oldpath" with NO status prefix at all — and this loop strips
+          # the first 3 bytes of every field uniformly. On the bare second
+          # field that silently eats the first 3 bytes of the OLD path
+          # instead of the 3-byte status prefix it assumes is there,
+          # corrupting a genuinely-changed filename into something else —
+          # Codex found this by picking an old path (a hypothetical
+          # "XXXchecks.md" renamed to "checks.md") whose corrupted form
+          # happens to land on the allowlist, hiding the rename entirely.
+          # Verified directly: `git status --porcelain -z` on a staged
+          # rename from XXXchecks.md to checks.md emits
+          # "R  checks.md\0XXXchecks.md\0" — that second field has no XY
+          # prefix. `--no-renames` reports the pair as an ordinary D/A
+          # instead, each with its own real prefix.
+          allow=("$LOCKFILE" checks.md deps-stat.txt report.md)
+          unexpected=""
+          git status --porcelain -z --untracked-files=all --no-renames | while IFS= read -r -d '' entry; do
+            path=${entry:3}
+            keep=1
+            for a in "${allow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            # `if`/`fi`, not `[ ... ] &&`: the loop body's own exit status
+            # is what the pipe reports to `pipefail` on its LAST iteration,
+            # and a `&&` whose left side is false (every ordinary run's
+            # allowlisted lockfile/report changes) makes that whole
+            # statement — and so the loop, and so the pipeline — exit
+            # nonzero even though nothing is wrong, aborting every normal
+            # run at `set -e` (Codex, on review: verified directly,
+            # `shopt -s lastpipe; set -eo pipefail; printf 'a\0' | while
+            # IFS= read -r -d '' e; do [ 0 -eq 1 ] && x=1; done; echo
+            # unreached` never reaches "unreached"). An `if` with no
+            # `else` always exits 0 when its condition is false.
+            if [ "$keep" -eq 1 ]; then
+              unexpected="$unexpected$path"$'\n'
+            fi
+          done
+          unexpected=${unexpected%$'\n'}
           if [ -n "$unexpected" ]; then
             echo '::error::The batch touched files outside the lockfile. Not opening a PR — inspect these first:'
             echo "$unexpected"
@@ -358,12 +410,28 @@ jobs:
           # reclassifies the workflow's own report as ignored, and without
           # the exemption every weekly run would abort on a file this job
           # wrote itself.
-          planted=$(git status --porcelain -z --ignored \
-            | tr '\0' '\n' | sed '/^$/d' \
-            | grep '^!! ' \
-            | sed 's/^!! //' \
-            | grep -Ev '^(.*/)?target/' \
-            | grep -Fxv -e report.md -e checks.md -e deps-stat.txt || true)
+          # Pipe, not a scratch file, and NUL-safe/status-failure-safe the
+          # same way the untracked pass above is — see its comment.
+          plantedallow=(report.md checks.md deps-stat.txt)
+          planted=""
+          git status --porcelain -z --ignored --no-renames | while IFS= read -r -d '' entry; do
+            case "$entry" in
+              '!! '*) path=${entry:3} ;;
+              *) continue ;;
+            esac
+            case "$path" in
+              target/*|*/target/*) continue ;;
+            esac
+            keep=1
+            for a in "${plantedallow[@]}"; do
+              if [ "$path" = "$a" ]; then keep=0; break; fi
+            done
+            # if/fi, not `[ ... ] &&` — see the untracked pass above.
+            if [ "$keep" -eq 1 ]; then
+              planted="$planted$path"$'\n'
+            fi
+          done
+          planted=${planted%$'\n'}
           if [ -n "$planted" ]; then
             echo '::error::The batch left unexpected IGNORED files in the tree. Not opening a PR — inspect these first:'
             echo "$planted"
