@@ -412,3 +412,133 @@ test("a staged rename onto an allowlisted destination doesn't hide the source pa
     rmSync(runnerTemp, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// The check-runner loop and the publish-side verdict derivation. The update
+// job's checks step runs unreviewed dependency code, so publish must never
+// read a pass/fail boolean that step reported about itself — it derives the
+// verdict from checks.md, whose bytes it first verified against the
+// fingerprint captured in the runner's control plane. Ported from the
+// identical fix in mikelward/npm-update (see its AGENTS.md "Trust model").
+// ---------------------------------------------------------------------------
+
+function extractChecksLoopBlock(text) {
+  const startMarker = 'checkdir=$(dirname -- "$LOCKFILE")';
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "checks-loop block start marker not found in rust-update.yml");
+  const endMarker = 'done <<< "$CHECKS"';
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "checks-loop block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+test("the update job exports no passed output; publish wires the verdict from its own derivation", () => {
+  // The boolean the untrusted job reported about itself is gone as an
+  // output, checks.md is fingerprinted in the same control-plane channel
+  // as the lockfile, publish verifies the downloaded copy against that
+  // fingerprint, and the PR step's PASSED comes from publish's own
+  // verdict step — the single place a false "all checks passed" can now
+  // come from is the file publish just verified.
+  assert.doesNotMatch(workflow, /passed: \$\{\{ steps\.checks\.outputs\.passed \}\}/);
+  assert.doesNotMatch(workflow, /needs\.update\.outputs\.passed/);
+  assert.match(workflow, /checks_sha: \$\{\{ steps\.checks\.outputs\.checks_sha \}\}/);
+  assert.match(workflow, /checks_sha=\$\(sha256sum checks\.md \| cut -d' ' -f1\)/);
+  assert.match(workflow, /CHECKS_SHA: \$\{\{ needs\.update\.outputs\.checks_sha \}\}/);
+  assert.match(
+    workflow,
+    /\[ "\$\(sha256sum -- checks\.md \| cut -d' ' -f1\)" = "\$CHECKS_SHA" \]/,
+    "publish no longer verifies checks.md against the update job's fingerprint",
+  );
+  assert.match(workflow, /PASSED: \$\{\{ steps\.verdict\.outputs\.passed \}\}/);
+});
+
+function extractVerdictBlock(text) {
+  const startMarker = "declare -A expected_count recorded_count";
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "verdict block start marker not found in rust-update.yml");
+  const endMarker = "echo 'passed=true' >> \"$GITHUB_OUTPUT\"\n          fi";
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "verdict block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+function runVerdictBlock(checksInput, checksMdContent) {
+  const dir = mkdtempSync(join(tmpdir(), "rust-update-verdict-"));
+  try {
+    writeFileSync(join(dir, "checks.md"), checksMdContent);
+    const outputFile = join(dir, "github_output");
+    writeFileSync(outputFile, "");
+    const script = `cd "$1"\nset -euo pipefail\n${extractVerdictBlock(workflow)}\n`;
+    execFileSync("bash", ["-c", script, "bash", dir], {
+      encoding: "utf8",
+      env: { ...process.env, CHECKS: checksInput, GITHUB_OUTPUT: outputFile },
+    });
+    return readFileSync(outputFile, "utf8");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("a configured check containing backticks still round-trips through the verdict", () => {
+  // Codex review: the first derivation parsed the command back out of its
+  // backtick delimiters with [^`]+, so a configured check that itself
+  // contains backticks (echo `date`, legal shell) wrote a line the parser
+  // refused — failing a batch whose check genuinely passed. Lines are now
+  // matched against the expected renderings built from the trusted
+  // config, which has no delimiter blind spot.
+  const checks = "echo `date`";
+  assert.match(runVerdictBlock(checks, "- ✅ `echo `date``\n"), /passed=true/);
+  assert.match(runVerdictBlock(checks, "- ❌ `echo `date`` (exit 1)\n"), /passed=false/);
+});
+
+test("the derived verdict passes only a checks.md that exactly matches the configured checks, all green", () => {
+  const checks = "cargo test --locked\ncargo clippy";
+  const green = "- ✅ `cargo test --locked`\n- ✅ `cargo clippy`\n";
+  assert.match(runVerdictBlock(checks, green), /passed=true/);
+
+  // Order doesn't matter — the loop records counts, not positions.
+  const reordered = "- ✅ `cargo clippy`\n- ✅ `cargo test --locked`\n";
+  assert.match(runVerdictBlock(checks, reordered), /passed=true/);
+
+  // A final line missing its trailing newline is still validated, not
+  // silently dropped by `while read`.
+  const noTrailing = "- ✅ `cargo test --locked`\n- ✅ `cargo clippy`";
+  assert.match(runVerdictBlock(checks, noTrailing), /passed=true/);
+
+  // A configured check listed twice runs twice and must be recorded twice.
+  const doubled = "cargo test --locked\ncargo test --locked";
+  const doubledMd = "- ✅ `cargo test --locked`\n- ✅ `cargo test --locked`\n";
+  assert.match(runVerdictBlock(doubled, doubledMd), /passed=true/);
+});
+
+test("the derived verdict fails closed on every malformed, mismatched, or failing checks.md", () => {
+  const checks = "cargo test --locked\ncargo clippy";
+  const cases = [
+    // A recorded failure.
+    ["- ✅ `cargo test --locked`\n- ❌ `cargo clippy` (exit 101)\n", "a ❌ line"],
+    // An empty file while checks are configured: every configured check is
+    // missing its record.
+    ["", "an empty checks.md"],
+    // One configured check silently absent.
+    ["- ✅ `cargo test --locked`\n", "a missing check record"],
+    // A duplicate ✅ padding out for the missing one — counts must match
+    // per-check, not in aggregate.
+    ["- ✅ `cargo test --locked`\n- ✅ `cargo test --locked`\n", "a duplicated record standing in for a missing one"],
+    // A check identity this run never configured.
+    ["- ✅ `cargo test --locked`\n- ✅ `cargo clippy`\n- ✅ `true`\n", "an unconfigured check"],
+    // A line outside the canonical format entirely.
+    ["- ✅ `cargo test --locked`\n- ✅ `cargo clippy`\nAll checks passed!\n", "a non-canonical line"],
+    // A ❌ line missing its exit code no longer parses — refused, not read
+    // as a pass or a failure of some guessed identity.
+    ["- ✅ `cargo test --locked`\n- ❌ `cargo clippy`\n", "a malformed ❌ line"],
+  ];
+  for (const [content, label] of cases) {
+    assert.match(
+      runVerdictBlock(checks, content),
+      /passed=false/,
+      `${label} did not fail closed`,
+    );
+  }
+});

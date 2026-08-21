@@ -122,9 +122,9 @@ jobs:
       contents: read
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
-      passed: ${{ steps.checks.outputs.passed }}
       base: ${{ steps.base.outputs.sha }}
       lockfile_sha: ${{ steps.changed.outputs.lockfile_sha }}
+      checks_sha: ${{ steps.checks.outputs.checks_sha }}
       engine_sha: ${{ steps.engine.outputs.sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -294,7 +294,7 @@ jobs:
             # checks.md or where the next check runs. The runner command
             # files are pointed at /dev/null inside it: they are the channel
             # a planted process would use to forge THIS step's own outputs
-            # (a "passed=true" written into $GITHUB_OUTPUT from inside a
+            # (a fingerprint written into $GITHUB_OUTPUT from inside a
             # check). Code running as this user can still hunt the real
             # files down on disk — same-machine isolation is not claimed,
             # and the design already reads check results as evidence, not
@@ -318,11 +318,21 @@ jobs:
           # missing verdict decide the title and the arming.
           set -e
           cat checks.md >> "$GITHUB_STEP_SUMMARY"
-          if [ $failed -eq 0 ]; then
-            echo 'passed=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'passed=false' >> "$GITHUB_OUTPUT"
-          fi
+          # checks.md just got its real, final content — fingerprint it now,
+          # the same way lockfile_sha was captured before any dependency
+          # code ran. The checks above compiled and ran dependency code in
+          # THIS job; a build script's background process could still be
+          # alive and rewrite the file on disk before upload-artifact reads
+          # it. A step OUTPUT is out of that process's reach (it lives in
+          # the runner's control plane, not the filesystem), and publish —
+          # a fresh runner that executes no dependency code — verifies the
+          # downloaded copy against it.
+          echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          # No pass/fail boolean written as this step's own output — publish
+          # derives that itself, from checks.md's own (fingerprint-verified)
+          # content, rather than trusting a second, independently-forgeable
+          # value from this same untrusted step. The sibling npm-update
+          # closed this exact gap first; see its AGENTS.md "Trust model".
           # Build scripts and proc macros ran above and $GITHUB_PATH /
           # $GITHUB_ENV apply to LATER steps, so a planted binary could
           # otherwise shadow `git` and `sha256sum` for the verification
@@ -585,6 +595,7 @@ jobs:
           # it is data, and a forged value is bounded to a failed
           # comparison.
           LOCKFILE_SHA: ${{ needs.update.outputs.lockfile_sha }}
+          CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
         run: |
           set -euo pipefail
           mv -- .dependency-update/checks.md .dependency-update/deps-stat.txt .dependency-update/report.md .
@@ -592,6 +603,98 @@ jobs:
           rm -rf -- .dependency-update
           [ "$(sha256sum -- "$LOCKFILE" | cut -d' ' -f1)" = "$LOCKFILE_SHA" ] \
             || { echo '::error::The lockfile does not match what the update job resolved.'; exit 1; }
+          # checks.md gates the PR title and auto-merge (the verdict step
+          # below derives them from its content), so it gets the same
+          # artifact-vs-control-plane check as the lockfile. deps-stat.txt
+          # and report.md stay unverified on purpose: purely informational,
+          # they gate nothing.
+          [ "$(sha256sum -- checks.md | cut -d' ' -f1)" = "$CHECKS_SHA" ] \
+            || { echo '::error::checks.md does not match what the update job recorded.'; exit 1; }
+
+      # The update job used to report a `passed` boolean about its own checks —
+      # produced inside the same untrusted step that compiled and ran
+      # dependency code, so a compromised build script's background process
+      # could append `passed=true` to the step's real $GITHUB_OUTPUT after
+      # the honest write (later duplicate keys win; the runner captures the
+      # file only at step end) and the PR would title itself clean, and arm
+      # auto-merge, while checks.md showed ❌ lines in the same body.
+      # Deriving the verdict HERE, from checks.md's own fingerprint-verified
+      # content, collapses those two independently-forgeable signals to one:
+      # the file this job just checked. Not a complete fix — a forger who
+      # fakes checks.md consistently with its own fingerprint inside the
+      # step's window still isn't caught — but it matches the posture the
+      # sibling npm-update already took for the same gap.
+      #
+      # Fails closed: a line that doesn't match the exact format the checks
+      # step writes, a check identity the consumer didn't configure, or a
+      # configured check recorded a different number of times than it was
+      # configured are all treated as failed, never silently passed. The
+      # configured list is trusted ground truth here: it comes from the
+      # consumer's own workflow file via workflow_call, not from anything
+      # the update runner produced.
+      - name: Derive the check verdict from checks.md, not the untrusted job's own report
+        id: verdict
+        env:
+          CHECKS: ${{ inputs.checks }}
+        run: |
+          set -euo pipefail
+          declare -A expected_count recorded_count
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            expected_count["$cmd"]=$(( ${expected_count["$cmd"]:-0} + 1 ))
+          done <<< "$CHECKS"
+          failed=0
+          # `|| [ -n "$line" ]` picks up a final line with no trailing
+          # newline — checks.md as the update job writes it always ends in
+          # one, but a forged or truncated file might not, and a plain
+          # `while read` would silently drop (and never validate) that
+          # last line.
+          #
+          # Each line is matched against the EXPECTED renderings built
+          # from the trusted config — never parsed generically out of its
+          # backtick delimiters. A configured command may itself contain
+          # backticks (`echo \`date\``, legal shell), which the writer
+          # embeds verbatim; a delimiter-parsing regex would refuse that
+          # line and fail a batch whose check genuinely passed (Codex
+          # review). Fixed-string comparison per configured command has no
+          # such blind spot, and an unmatched line still fails closed.
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            matched=''
+            for cmd in "${!expected_count[@]}"; do
+              if [ "$line" = "- ✅ \`$cmd\`" ]; then
+                matched=$cmd
+                is_failed=0
+                break
+              fi
+              prefix="- ❌ \`$cmd\` (exit "
+              rest=${line#"$prefix"}
+              if [ "$rest" != "$line" ] && [[ "$rest" =~ ^[0-9]+\)$ ]]; then
+                matched=$cmd
+                is_failed=1
+                break
+              fi
+            done
+            if [ -z "$matched" ]; then
+              echo "::error::checks.md has a line that records no configured check in the canonical format — treating as failed rather than guessing: $line"
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            recorded_count["$matched"]=$(( ${recorded_count["$matched"]:-0} + 1 ))
+            [ "$is_failed" -eq 1 ] && failed=1
+          done < checks.md
+          for cmd in "${!expected_count[@]}"; do
+            if [ "${recorded_count[$cmd]:-0}" -ne "${expected_count[$cmd]}" ]; then
+              echo "::error::checks.md records '$cmd' ${recorded_count[$cmd]:-0} time(s), expected ${expected_count[$cmd]} — treating as failed rather than guessing."
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
+          if [ "$failed" -eq 1 ]; then
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          else
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Fetch the validator
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
@@ -701,8 +804,12 @@ jobs:
           # it — it is the job that scheduled this very run.
           DEFAULT_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
-          # Env, not inline — see the fingerprint step.
-          PASSED: ${{ needs.update.outputs.passed }}
+          # From THIS job's own "Derive the check verdict" step — computed
+          # from fingerprint-verified checks.md — never the untrusted
+          # update job's own report of itself. Env, not inline — see the
+          # fingerprint step. PASSED also drives the auto-merge arming
+          # later in this same step.
+          PASSED: ${{ steps.verdict.outputs.passed }}
           LOCKFILE_SHA: ${{ needs.update.outputs.lockfile_sha }}
         run: |
           set -euo pipefail
