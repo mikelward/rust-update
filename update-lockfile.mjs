@@ -276,16 +276,25 @@ const parseComparator = (cmp) => {
   // refuse `1.*.2` shapes. An operator with a TRAILING wildcard is a
   // partial version to Cargo (">=1.*" means ">=1", "^1.2.*" means "^1.2"),
   // so the wildcard drops rather than refusing — only a bare `*` takes no
-  // operator at all.
+  // operator at all. With NO operator, though, a wildcard is not caret: the
+  // semver crate parses it as Op::Wildcard (parse.rs: `if default_op { op =
+  // Op::Wildcard }`), which evaluates like `=` on the specified components
+  // (eval.rs: `Op::Exact | Op::Wildcard => matches_exact`) — "1.2.*" means
+  // >=1.2.0, <1.3.0, NOT ^1.2's <2.0.0. Dropping the wildcard under the
+  // bare-comparator default (caret) got that wrong wherever caret and
+  // wildcard diverge (major > 0 with a minor specified), a false PASS in
+  // the graph check for an edge the requirement doesn't admit.
   if (wild(maj)) {
     if (op || min !== undefined || pat !== undefined || pre !== undefined) return null;
     maj = min = pat = pre = undefined;
   } else if (min !== undefined && wild(min)) {
     if ((pat !== undefined && !wild(pat)) || pre !== undefined) return null;
     min = pat = undefined;
+    if (!op) op = "=";
   } else if (pat !== undefined && wild(pat)) {
     if (pre !== undefined) return null;
     pat = undefined;
+    if (!op) op = "=";
   }
   const M = maj === undefined ? undefined : Number(maj);
   const mn = min === undefined ? undefined : Number(min);
