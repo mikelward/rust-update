@@ -255,8 +255,17 @@ test("reqMatches transcribes the semver crate's comparator semantics", () => {
     [">1.2", "1.3.0", true], [">1.2", "1.2.9", false],
     ["<=1.2", "1.2.9", true], ["<=1.2", "1.3.0", false],
     ["<1", "0.9.0", true], ["<1", "1.0.0", false],
-    // wildcards
+    // wildcards. A bare (no-operator) wildcard is Op::Wildcard in the
+    // semver crate, which evaluates like `=` on the specified components
+    // (eval.rs: `Op::Exact | Op::Wildcard => matches_exact`) — NOT the
+    // bare-comparator caret default. "1.*" coincides with ^1 either way;
+    // "1.2.*" is where they diverge (=1.2's <1.3.0 vs ^1.2's <2.0.0),
+    // which an earlier version got wrong: a false pass for "1.2.*" vs
+    // 1.5.0 in the graph check.
     ["*", "1.0.0", true], ["1.*", "1.5.0", true], ["1.*", "2.0.0", false],
+    ["1.2.*", "1.2.0", true], ["1.2.*", "1.2.9", true], ["1.2.*", "1.5.0", false],
+    ["1.2.x", "1.5.0", false], ["1.2.X", "1.5.0", false], ["1.2.*", "1.1.9", false],
+    ["0.4.*", "0.4.9", true], ["0.4.*", "0.5.0", false],
     // the prerelease gate: same triple plus a prerelease on the comparator
     ["*", "1.0.0-rc.1", false], [">=1.0.0", "1.0.1-rc.1", false],
     ["=2.0.0-rc.1", "2.0.0-rc.1", true], [">=1.0.0-alpha", "1.0.0-beta", true],
