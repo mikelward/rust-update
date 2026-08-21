@@ -299,10 +299,16 @@ jobs:
             # files down on disk — same-machine isolation is not claimed,
             # and the design already reads check results as evidence, not
             # proof — but the casual channel costs one line to close.
+            # Stdin redirected too: the loop's own herestring IS the
+            # subshell's inherited stdin, so a check that reads stdin
+            # (cargo's client does; so does anything piping through cat)
+            # would otherwise DRAIN the remaining commands — the loop ends
+            # early and every unrun check silently never reports, a false
+            # pass shaped exactly like the ones this file exists to refuse.
             ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
                 GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
                 GITHUB_STATE=/dev/null
-              cd -- "$checkdir" && eval "$cmd" )
+              cd -- "$checkdir" && eval "$cmd" ) < /dev/null
             rc=$?
             echo '::endgroup::'
             if [ $rc -eq 0 ]; then

@@ -433,6 +433,46 @@ function extractChecksLoopBlock(text) {
   return raw.replace(/^ {10}/gm, "");
 }
 
+test("a check that drains stdin cannot swallow the commands after it", () => {
+  // The loop feeds itself through a herestring, and each eval'd check used
+  // to inherit that herestring as its own stdin — so a check that reads
+  // stdin (cargo's own client does; so does anything piping through
+  // `cat`) DRAINED the remaining commands: the loop ended early, the unrun
+  // checks never reported, failed stayed 0, and the batch titled itself
+  // clean on checks that never ran. Verified against the exact loop
+  // structure before fixing: with the redirect absent, this case records
+  // one ✅ line and exits with failed=0.
+  assert.match(
+    extractChecksLoopBlock(workflow),
+    /\) < \/dev\/null\n\s*rc=\$\?/,
+    "the eval subshell no longer redirects stdin — the herestring-drain fix regressed",
+  );
+
+  const dir = mkdtempSync(join(tmpdir(), "rust-update-checksloop-"));
+  try {
+    writeFileSync(join(dir, "Cargo.lock"), "x");
+    const script = [
+      'cd "$1"',
+      'LOCKFILE="Cargo.lock"',
+      "CHECKS=$'cat > /dev/null\\nfalse'",
+      "failed=0",
+      ": > checks.md",
+      extractChecksLoopBlock(workflow),
+      'echo "failed=$failed"',
+    ].join("\n");
+    const out = execFileSync("bash", ["-c", script, "bash", dir], { encoding: "utf8" });
+    const checksMd = readFileSync(join(dir, "checks.md"), "utf8");
+    assert.equal(
+      checksMd,
+      "- ✅ `cat > /dev/null`\n- ❌ `false` (exit 1)\n",
+      "the stdin-draining first check swallowed the second — it never ran or never reported",
+    );
+    assert.match(out, /failed=1/, "the failing second check did not set failed=1");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("the update job exports no passed output; publish wires the verdict from its own derivation", () => {
   // The boolean the untrusted job reported about itself is gone as an
   // output, checks.md is fingerprinted in the same control-plane channel
