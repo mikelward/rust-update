@@ -25,8 +25,10 @@ one that has stopped biting.
   no-majors rule, adoption logic, docs lane. A fix to a shared mechanism here
   usually has a twin there; say so in the PR rather than letting the siblings
   drift.
-- **Everything below the config section of `scripts/docs-lane.sh` is engine
-  code shared with the sibling repos** — change it everywhere or not at all.
+- **The docs lane's engine is `mikelward/lanes`, tracked `@main`** — this
+  repo carries only its policy (`.github/lanes.conf`) and the thin CI jobs
+  that invoke it. Engine fixes go there, not here; the hand-synced
+  `scripts/docs-lane.sh` copy this rule used to guard is gone.
 
 ## What this repository must not grow
 
