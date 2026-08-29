@@ -81,7 +81,11 @@ one that has stopped biting.
   automatically. Address its comments without being asked, folding each fix
   into the commit it belongs to. Judge every comment on merit: verify the
   claim before acting, and if it doesn't hold up, reply saying why and
-  decline.
+  decline. A comment citing a rule is a *reading* of that rule, not the rule
+  — check what the rule actually says, since an over-strict reading (the
+  privacy rules especially, where stricter always feels safer) costs real
+  capability. A genuine conflict between the rule and what the code needs is
+  the maintainer's call, not one to resolve by quietly narrowing the code.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
 
