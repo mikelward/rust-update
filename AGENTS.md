@@ -75,8 +75,8 @@ one that has stopped biting.
   `--force-with-lease` after a rebase, never a bare `--force`.
 - **Open the pull request without being asked**, ready for review, not a
   draft.
-- **Refresh the title and body on every push** so they describe the branch's
-  latest state, not the scope it had when opened.
+- **Refresh the title and body with the push, not after it** — same step, so
+  they describe the branch's latest state, not the scope it had when opened.
 - **Codex is the automated reviewer**, and its reviews are triggered
   automatically. Address its comments without being asked, folding each fix
   into the commit it belongs to. Judge every comment on merit: verify the
