@@ -63,10 +63,17 @@ run was clicked "approve" and trusting it forever after.
    the account → select repositories → choose `root` and `mesh` explicitly
    rather than "All repositories", so adding a new repository to the
    account never silently grants this App access to it.
-5. **Add two secrets to each consumer repository** (Settings → Secrets and
-   variables → Actions → New repository secret) — repeated per repository
-   because a personal GitHub account has no account-wide secret store the
-   way an organization does:
+5. **Add two secrets to each consumer repository's `rust-update` environment**
+   (Settings → Environments → `rust-update` → Environment secrets; or, from
+   mikelward/repo, `repo secrets --name NAME --env rust-update --file PATH
+   OWNER/REPO...` once per secret, which creates the environment when it is
+   missing) — repeated per repository because a personal GitHub account has
+   no account-wide secret store the way an organization does, and as
+   environment rather than repository secrets on purpose: a repository secret
+   passed to a reusable workflow reaches the runner of every job in it, the
+   update job included, where build-script and proc-macro code runs with sudo,
+   while an environment secret reaches only the job that declares the
+   environment, and only the publish job does:
    - `RUST_UPDATE_APP_ID` — the numeric App ID from step 3.
    - `RUST_UPDATE_APP_PRIVATE_KEY` — the full contents of the `.pem` file
      from step 2, unmodified (`-----BEGIN RSA PRIVATE KEY-----` line and
@@ -74,8 +81,9 @@ run was clicked "approve" and trusting it forever after.
 
 ## What the consumer's caller workflow passes
 
-`rust-update.yml` accepts these as a `secrets:` block on `workflow_call`. A
-consumer opts in by passing them through:
+The publish job reads both from the `rust-update` environment when the caller
+passes `secrets: inherit` — the only way an environment secret can reach a
+called workflow. A consumer opts in like this:
 
 ```yaml
 jobs:
@@ -85,9 +93,12 @@ jobs:
       contents: write
       pull-requests: write
       actions: write
-    secrets:
-      app-id: ${{ secrets.RUST_UPDATE_APP_ID }}
-      app-private-key: ${{ secrets.RUST_UPDATE_APP_PRIVATE_KEY }}
+    # `inherit`, not a `secrets:` block naming the pair: an environment
+    # secret reaches a called workflow no other way. zizmor flags this
+    # (secrets-inherit); allow it for this file in .github/zizmor.yml, with
+    # this reason. The older `secrets: app-id: ...` block still works but
+    # delivers the key to every job's runner.
+    secrets: inherit
     with:
       # ...existing inputs...
 ```
