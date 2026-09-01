@@ -125,7 +125,6 @@ jobs:
       base: ${{ steps.base.outputs.sha }}
       lockfile_sha: ${{ steps.changed.outputs.lockfile_sha }}
       checks_sha: ${{ steps.checks.outputs.checks_sha }}
-      engine_sha: ${{ steps.engine.outputs.sha }}
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
@@ -146,23 +145,26 @@ jobs:
         id: base
         run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      # The engine, from this repository at main — the same convention as
-      # consuming the workflow itself at @main: no build step, no
-      # dependencies, the file that runs is the file you can read there.
+      # The engine, from this repository at the exact revision of the
+      # workflow that is running — `job.workflow_sha` — never a moving ref.
+      # That is the commit the caller's `uses:` resolved, whichever ref it
+      # named, so a consumer piloting a branch runs THAT branch's engine
+      # rather than main's, and the publish job pins the validator to the
+      # same revision below without this job having to report which one it
+      # used. It used to: the sha traveled as a job output, and a job output
+      # is something this untrusted job writes — a forged one would have
+      # pointed publish, with the write credential in its env, at any commit
+      # reachable from this repository, a fork's pull request head included.
+      # The `job` context on purpose: inside a called workflow the `github`
+      # context is the caller's, so `github.workflow_sha` would name the
+      # consumer's commit, which this repository does not hold.
       - name: Fetch the update engine
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           repository: mikelward/rust-update
-          ref: main
+          ref: ${{ job.workflow_sha }}
           path: .rust-update
           persist-credentials: false
-
-      # One immutable revision for the whole run: the publish job checks the
-      # validator out at THIS sha, so main advancing mid-run cannot validate
-      # the batch under different rules than resolved it.
-      - name: Record the engine revision
-        id: engine
-        run: echo "sha=$(git -C .rust-update rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       # Runs `cargo update` under the consumer's pinned toolchain, then
       # enforces the cooldown and the no-transitive-majors rule from
@@ -706,10 +708,12 @@ jobs:
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd  # v5.0.1
         with:
           repository: mikelward/rust-update
-          # The exact revision the update job resolved with — never a moving
-          # ref, so the batch is validated under the same rules that made
-          # it.
-          ref: ${{ needs.update.outputs.engine_sha }}
+          # The same pin the update job used — the revision of the workflow
+          # that is running, read from the runner's own context rather than
+          # from anything the update job reported. The batch is validated
+          # under the rules that resolved it, and nothing the untrusted job
+          # writes can choose what code runs here.
+          ref: ${{ job.workflow_sha }}
           path: .rust-update
           persist-credentials: false
 
