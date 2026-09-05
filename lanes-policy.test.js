@@ -48,6 +48,7 @@ describe("the lane policy", () => {
     assert.deepEqual(rules, [{ verdict: "docs", pattern: "**/*.md" }]);
     assert.deepEqual(directives.prefixes, ["docs"]);
     assert.deepEqual(directives["dispatch-without-pr"], ["refuse"]);
+    assert.deepEqual(directives["lint-title"], ["no"]);
   });
 
   test("markdown rides the docs lane, at the root and nested", () => {
