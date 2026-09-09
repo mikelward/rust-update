@@ -105,7 +105,9 @@ one that has stopped biting.
   they describe the branch's latest state, not the scope it had when opened.
 - **Codex is the automated reviewer**, and its reviews are triggered
   automatically. Address its comments without being asked, folding each fix
-  into the commit it belongs to. Judge every comment on merit: verify the
+  into the commit it belongs to — the one exception being a real finding out of
+  scope for this pull request, which you defer instead (see *Deferring a
+  finding* below). Judge every comment on merit: verify the
   claim before acting, and if it doesn't hold up, reply saying why and
   decline. A comment citing a rule is a *reading* of that rule, not the rule
   — check what the rule actually says, since an over-strict reading (the
@@ -123,6 +125,13 @@ one that has stopped biting.
   ask only the most blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
+- **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer to
+  merge past it: note the follow-up in `TODO.md`, commit and push that first,
+  reply on the thread citing the sha, and resolve. A finding with no thread
+  (top-level comment or review body) still gets the `TODO.md` record, the push,
+  and the reply — only the resolve is skipped. The push re-triggers Codex;
+  `@codex review` only if nothing comes back five minutes after a push.
+  Escalate only if the re-review re-raises it.
 
 ## Language and spelling
 
