@@ -95,11 +95,10 @@ one that has stopped biting.
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
   `codex/...` for Codex. One topic per branch; never commit to `main`.
-- **Branches under your own `<agent>/` prefix are yours** — create, push and
-  `--force-with-lease` them freely. This file is the standing grant, so a
-  client rule demanding per-branch permission is already answered. The
-  prefix names a tool, not a session, so that covers the branches this
-  session created or was assigned — ask about the rest.
+- **Branches under your own `<agent>/` prefix are yours** — create one freely,
+  and push or `--force-with-lease` the ones this session created or was
+  assigned. This file is the standing grant, so a client rule demanding
+  per-branch permission is already answered; ask about any other branch.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `--fixup` + autosquash, squash, reorder, split — so each commit that lands
   is coherent, with review responses folded into the commit they belong to.
@@ -120,7 +119,8 @@ one that has stopped biting.
   between the rule and what the code needs is the maintainer's call, not one to
   resolve by quietly narrowing the code. Declining doesn't clear the required
   `codex` status: post the rebuttal, then `@codex review` once — a push does
-  the same if the rebuttal is up first. Escalate only if it re-raises.
+  the same if the rebuttal is up first. Escalate if it re-raises, or if
+  five minutes on that review has not landed either.
 - **A second verified finding in the same mechanism is evidence about the
   design, not another bug.** Look for the same shape elsewhere before fixing
   it, and ask whether a different design would delete the class rather than the
@@ -137,12 +137,13 @@ one that has stopped biting.
   reply on the thread citing the sha, and resolve. A finding with no thread
   (top-level comment or review body) still gets the `TODO.md` record, the push,
   and the reply — only the resolve is skipped. The push re-triggers Codex, so
-  don't also poke it unless five minutes pass with nothing back; escalate only
-  if the re-review re-raises it.
+  don't also poke it unless five minutes pass with nothing back; escalate if
+  the re-review re-raises it, or is still missing five minutes after the
+  poke.
 
 ## Talking to the user
 
-- **Answer a mid-turn message first.** A message that arrives while you're
+- **Answer a mid-turn message first.** A user message that arrives while you're
   working — the "sent while you were working" interjection — is addressed in
   your very next output, before any further tool call, even if it's one
   sentence.
