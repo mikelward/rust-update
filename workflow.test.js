@@ -618,3 +618,46 @@ test("the derived verdict fails closed on every malformed, mismatched, or failin
     );
   }
 });
+
+function extractTitleBlock(text) {
+  const startMarker = "# An empty prefix means a bare subject";
+  const start = text.indexOf(startMarker);
+  assert.notEqual(start, -1, "title block start marker not found in rust-update.yml");
+  const endMarker = "verdict='All checks passed in the job that produced this branch.'\n          fi";
+  const end = text.indexOf(endMarker, start);
+  assert.notEqual(end, -1, "title block end marker not found");
+  const raw = text.slice(start, end + endMarker.length);
+  return raw.replace(/^ {10}/gm, "");
+}
+
+function runTitleBlock({ commitPrefix, passed }) {
+  const script = `set -euo pipefail\n${extractTitleBlock(workflow)}\nprintf '%s' "$title"\n`;
+  return execFileSync("bash", ["-c", script, "bash"], {
+    encoding: "utf8",
+    env: { ...process.env, COMMIT_PREFIX: commitPrefix ?? "", PASSED: passed ?? "true" },
+  });
+}
+
+test("an empty commit-prefix leaves the title bare, with no leading space", () => {
+  // A leading space left over from naively prepending "$COMMIT_PREFIX "
+  // would be a visible typo in every commit subject and PR title, and the
+  // default is an empty prefix.
+  assert.equal(runTitleBlock({ commitPrefix: "" }), "Update dependencies");
+  assert.equal(runTitleBlock({ commitPrefix: "", passed: "false" }), "Update dependencies — CHECKS FAILING");
+  assert.equal(runTitleBlock({ commitPrefix: "internal:" }), "internal: Update dependencies");
+});
+
+test("the title carries no run date", () => {
+  // The title becomes the merge commit's subject, and a consumer that ships
+  // commit subjects as release notes puts it in front of users — where a run
+  // date is the one part that varies week to week and the one part a user
+  // cannot act on. Asserted as an absence, so re-adding it to tell weekly
+  // batches apart fails here: the commit's own author date, the
+  // `deps/update-<date>` branch and the PR all still record when a batch ran.
+  for (const passed of ["true", "false"]) {
+    const title = runTitleBlock({ commitPrefix: "", passed });
+    assert.match(title, /^Update dependencies/);
+    assert.doesNotMatch(title, /\d{4}-\d{2}-\d{2}/);
+    assert.doesNotMatch(title, /[()]/);
+  }
+});

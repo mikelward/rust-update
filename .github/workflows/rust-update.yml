@@ -863,11 +863,20 @@ jobs:
           branch="deps/update-$today"
 
           # An empty prefix means a bare subject — no stray leading space.
+          #
+          # No date in the title, deliberately. The title becomes the merge
+          # commit's subject, and a consumer that ships commit subjects as
+          # release notes puts that subject in front of users — where a run
+          # date is the one part that varies and the one part a user cannot
+          # act on, so it reads as a build stamp that leaked in. Nothing is
+          # lost: the commit carries its own author date, the branch is
+          # still `deps/update-$today`, and the PR records when it opened.
+          # Don't add it back to tell weekly batches apart.
           if [ "$PASSED" != 'true' ]; then
-            title="${COMMIT_PREFIX:+$COMMIT_PREFIX }Update dependencies ($today) — CHECKS FAILING"
+            title="${COMMIT_PREFIX:+$COMMIT_PREFIX }Update dependencies — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
           else
-            title="${COMMIT_PREFIX:+$COMMIT_PREFIX }Update dependencies ($today)"
+            title="${COMMIT_PREFIX:+$COMMIT_PREFIX }Update dependencies"
             verdict='All checks passed in the job that produced this branch.'
           fi
 
