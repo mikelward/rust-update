@@ -140,6 +140,16 @@ one that has stopped biting.
   don't also poke it unless five minutes pass with nothing back; escalate only
   if the re-review re-raises it.
 
+## Talking to the user
+
+- **Answer a mid-turn message first.** A message that arrives while you're
+  working — the "sent while you were working" interjection — is addressed in
+  your very next output, before any further tool call, even if it's one
+  sentence.
+- **Don't narrate routine machinery.** A check run flipping, a re-run, a
+  scheduled check re-arming, a webhook echo, a resolved thread — act on those
+  silently; the noise buries the one line that matters.
+
 ## Language and spelling
 
 - Use **US English** everywhere people read English: prose, commit subjects
