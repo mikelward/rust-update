@@ -391,6 +391,37 @@ export const reqMatches = (req, version) => {
 export const sourceIdentityOf = (source) =>
   source === null || source === undefined ? "" : String(source).split("#")[0];
 
+// A package's identity, in Cargo's own package-ID form: `source#name@version`
+// (`cargo pkgid` prints exactly this, and `cargo update` takes it). A name and
+// a version are NOT an identity here -- one graph can hold a crates.io copy
+// and a git copy of the same crate at the same version, which is why
+// `groupByCompat` and `specFor` both exist -- so anything asking "is this the
+// same package" compares this whole string.
+//
+// The source's `#fragment` is dropped on purpose: for a git dependency that is
+// the revision, so two packages differing only by revision compare as the same
+// crate from the same place. This identifies a package WITHIN one snapshot of
+// the graph; across a move that changes the version, see `isAt`.
+// The CRATE a package is a version of: its package ID without the version.
+// `idOf` identifies a package in the graph; this names the crate underneath
+// one or more of them, and `slotOf` narrows it back to a compatibility group.
+export const crateOf = (pkg) => `${sourceIdentityOf(pkg.source)}#${pkg.name}`;
+
+export const idOf = (pkg) => `${crateOf(pkg)}@${pkg.version}`;
+
+// Whether `pkg` is the package a pin landed on. A restoration is identified by
+// where it LANDED, not where it came from: the version -- or, for a git
+// dependency, the revision -- is exactly what the pin changed, so an `idOf`
+// captured beforehand can never match the package in the finished lockfile.
+// Source and name alone would not do either, since one graph can hold two
+// pre-release copies of a crate at incompatible versions, so the target
+// travels with them. `pin`'s own success check and the report's lookup both
+// ask this one question, so they cannot drift apart.
+export const isAt = (pkg, source, name, to) =>
+  pkg.name === name &&
+  sourceIdentityOf(pkg.source) === source &&
+  (pkg.version === to || (pkg.source ?? "").endsWith(`#${to}`));
+
 // The compatibility identity Cargo's caret semantics assign a version: the
 // major — except at 0.x, where the MINOR is the breaking boundary, and at
 // 0.0.x, where every release is. Two versions are semver-compatible to
@@ -403,6 +434,19 @@ export const compatKeyOf = (v) => {
   if (p.minor > 0) return `0.${p.minor}`;
   return `0.0.${p.patch}`;
 };
+
+// The compatibility SLOT a crate's version occupies: the crate plus the compat
+// group that version falls in. `idOf` identifies a package and `crateOf` the
+// crate; this identifies what the report's final pass ITERATES -- one package
+// per crate per compat group -- so it is the granularity at which "did this run
+// choose this version" can be asked. Renamed dependencies put two incompatible
+// versions of one crate in a graph, and the crate alone cannot tell them apart:
+// pinning the 1.x copy would answer for the 2.x one, hiding a hold-back that
+// really is the manifest's. The version is passed in rather than read off the
+// package, because at pin time the answer is about the target, not the version
+// being left behind. `compatKeyOf` is null for a git revision, which matches
+// nothing -- correct, since the final pass asks only about crates.io packages.
+export const slotOf = (pkg, version) => `${crateOf(pkg)}@${compatKeyOf(version)}`;
 
 // ---------------------------------------------------------------------------
 // Lockfile diff: what moved, what arrived, what left.
@@ -643,6 +687,33 @@ export const findPinback = async (
 // The whole update.
 // ---------------------------------------------------------------------------
 
+/**
+ * The packages Cargo names as standing in the way of a `--precise` pin, from
+ * its own error output, nearest blocker first.
+ *
+ * A crate family that pins itself with exact `=` requirements cannot be
+ * unwound one package at a time: `cargo update --precise 0.2.127
+ * wasm-bindgen-macro-support` is refused because `wasm-bindgen-macro v0.2.128`
+ * requires exactly 0.2.128, and pinning THAT is refused because `js-sys`
+ * requires `wasm-bindgen` exactly in turn. The reachable pin is an ancestor's.
+ *
+ * An exact `=` is the motivating shape, not the only one Cargo reports this
+ * way: an ordinary range that excludes the requested version (a parent that
+ * raised `^1.0` to `^1.1`) names its package in the same form, and rolling
+ * THAT back can succeed too. So nothing here — or in the report the walk
+ * feeds — claims the blocking requirement was exact; the error text carries
+ * the requirement, but tying each one to the right blocker is a second parse
+ * of a format Cargo is free to change, and the walk does not need it.
+ *
+ * Cargo's error is the only signal available for this: a lockfile records
+ * resolved edges, not the requirement strings that make one exact, so nothing
+ * in the graph this tool parses distinguishes `=0.2.128` from `^0.2`.
+ */
+export const blockersFrom = (output) =>
+  [...String(output ?? "").matchAll(/required by package `([^`\s]+) v([^`\s]+)`/g)].map(
+    ([, name, version]) => ({ name, version }),
+  );
+
 // Runs `cargo update`, then enforces the cooldown and the no-transitive-
 // majors rule by pinning offenders back, then derives the report. Effects
 // are injected: `readLockfile` returns the current lockfile text,
@@ -696,13 +767,39 @@ export const updateLockfile = async ({
   // carry the walk's reasons; `crossings` name the dependent pinned back
   // and the major it would have dragged in; `blocking` is what nothing
   // could fix.
+  //
+  // `cooldown` records an action, so it is written where that action's
+  // outcome is known — after the pin, not before it. `crossings` records a
+  // DETECTION, whose outcome is known when it is detected: the crossing is
+  // real whether or not a pin can unwind it, and a batch that cannot unwind
+  // one blocks with the entry still standing. Don't "fix" that asymmetry by
+  // moving the crossing push; do keep any new record on the side its own
+  // outcome is settled.
   const cooldown = [];
   const crossings = [];
   const restored = [];
   const blocking = [];
-  // Pins already applied, so a round never re-fights a decision — and so a
-  // package pinned back for a crossing is not then "fixed" again.
-  const pinned = new Set();
+  // Every compatibility slot (see `slotOf`) whose version in the finished
+  // lockfile is THIS RUN's choice rather than the resolver's: a crossing mover
+  // pinned back, an ancestor rolled back to reach one, a restoration, a
+  // cooldown deferral. The final pass needs it so a miss the engine caused is
+  // not blamed on the manifest.
+  const pinnedHere = new Set();
+  // Every pin is recorded where its outcome is known, never where it is
+  // asked for, and the two outcomes have different lifetimes.
+  //
+  // `applied` is the run: a pin that landed changed the lockfile, so being
+  // asked for it again means the violation it was meant to fix survived
+  // it. That is a stuck batch and gets reported rather than re-fought.
+  //
+  // `refused` is the ROUND. A refusal changes nothing, so within one round
+  // the same request has the same answer and is worth memoizing — but a
+  // pin that lands moves the graph, and the request cargo refused against
+  // the old one may resolve against the new. That is the whole point of
+  // the ancestor unwind below, and holding refusals for the run is what
+  // used to block the retry it exists to enable.
+  const applied = new Set();
+  let refused = new Map();
 
   let newText = readLockfile();
   let newLock = parseLockfile(newText);
@@ -721,6 +818,9 @@ export const updateLockfile = async ({
     }
 
     let acted = false;
+    // Refusals are judged against this round's graph, so they expire with
+    // it — see the declaration above.
+    refused = new Map();
     // Blocking judged this round, held apart from the durable list: a pin
     // reshapes the graph, so a violation judged before the round's pin can
     // name a package the pin removes. If the round ends with a pin, these
@@ -728,21 +828,244 @@ export const updateLockfile = async ({
     // that settles with no pin gets to make its blocks final.
     const roundBlocking = [];
     const block = (why) => roundBlocking.push(why);
-    const pin = (spec, to, why) => {
+    // Returns `false` when no pin landed, otherwise `{ reached, via? }`.
+    //
+    // The two facts are separate and every caller needs the right one.
+    // Truthy means A PIN LANDED: the graph has moved, so the round is over
+    // and the caller stops. `reached` means THE REQUESTED PACKAGE is now at
+    // the target this pin asked for, which a pin through an ancestor
+    // achieves only when that ancestor's requirement drags it (an exact `=`
+    // does, an excluding range does not — and a revert can also delete the
+    // package outright). Anything recording the requested package's own
+    // arrival — `restored`, `cooldown`, a crossing's `via` — is gated on
+    // `reached`, or it asserts something that did not happen.
+    // Cargo names a blocker in prose -- `required by package `p v1.0.0`` --
+    // which is a name and a version, not a package ID. That pair is not an
+    // identity, so resolving it against the graph is a lookup that can return
+    // none, one, or several.
+    //
+    // Cargo's own answer to the same problem is the model. A package-ID spec
+    // is a PARTIAL identity resolved against the graph: `cargo pkgid syn@3`
+    // finds one package, and bare `syn` on a graph holding syn 2 and syn 3
+    // does not choose -- it errors, lists the candidates, and does nothing.
+    // So: exactly one is the only case that proceeds. Pinning the wrong copy
+    // back would revert an unrelated, valid update, which is worse than the
+    // walk declining to route through it.
+    //
+    // The graph narrows what the prose cannot. A blocker is a package whose
+    // requirement refused this pin, so it has a dependency edge to the package
+    // being pinned; where name and version alone are ambiguous, keeping only
+    // the copies carrying that edge usually leaves one. `blocker.of` is what
+    // the failure was about, which is why the queue carries it.
+    const resolveBlocker = (blocker) => {
+      const byNameVersion = newLock.packages.filter(
+        (o) => o.name === blocker.name && o.version === blocker.version,
+      );
+      if (byNameVersion.length < 2 || blocker.of === undefined) return byNameVersion;
+      const connected = byNameVersion.filter((o) =>
+        (o.dependencies ?? []).some((ref) => resolveDepRef([blocker.of], ref).length > 0),
+      );
+      // Narrowing to nothing means the edge is not visible here; report the
+      // ambiguity rather than silently dropping every candidate.
+      return connected.length === 0 ? byNameVersion : connected;
+    };
+
+    const pin = (pkg, to, why) => {
+      // The package, not a formatted spec: the spec is derived here so the
+      // identity stays available. Parsing it back out of the string lost the
+      // source, and two packages can share a name — `groupByCompat` and
+      // `specFor` both exist for exactly that.
+      const spec = specFor(pkg);
       const key = `${spec}@${to}`;
-      if (pinned.has(key)) {
-        // Asking for a pin that already happened means this round's
-        // violation survived the previous round's fix: report, stop.
+      if (applied.has(key)) {
+        // Asking for a pin that already landed means this round's
+        // violation survived that fix: report, stop.
         block(why);
-        return;
+        return false;
+      }
+      if (refused.has(key)) {
+        // Same request, same graph, same answer — replay it rather than
+        // spend another cargo invocation reaching it.
+        block(`${why} — and pinning ${spec} back to ${to} failed:\n${refused.get(key)}`);
+        return false;
       }
       const result = runCargo(["update", spec, "--precise", to]);
-      pinned.add(key);
       if (result.ok) {
+        applied.add(key);
+        pinnedHere.add(slotOf(pkg, to));
         acted = true;
-        return true;
+        // Cargo confirmed it set this spec to `to`; nothing to re-read.
+        return { reached: true };
       }
-      block(`${why} — and pinning ${spec} back to ${to} failed:\n${result.output}`);
+      refused.set(key, result.output);
+      // Refused. Before blocking the whole batch, walk the ancestors Cargo
+      // named: whoever requires the mover at a version this pin would
+      // exclude is where the reachable pin is, and pinning THEM back drags
+      // the mover with them — the same outcome by the only route the
+      // resolver allows. The motivating case is a family that pins itself
+      // with exact `=` requirements (wasm-bindgen), which leaves no
+      // reachable pin on the mover at all; an ordinary range that excludes
+      // the version reads the same way to Cargo and is handled the same.
+      // Breadth-first from the nearest blocker, each visited once, bounded
+      // by the graph.
+      const seen = new Set();
+      // Each entry carries the package whose pin the failure was about, so a
+      // blocker named ambiguously can be narrowed by the edge it refused on —
+      // see `resolveBlocker`.
+      const queue = blockersFrom(result.output).map((b) => ({ ...b, of: pkg }));
+      // Every ancestor tried and every one that could not be, kept for the
+      // failure message: a walk that ends in a block has to say what it
+      // did, or a blocked consumer is left with only the mover's refusal
+      // and no sign the ancestors were ever considered.
+      const tried = [];
+      const skipped = [];
+      // `seen` is what terminates this: a finite graph, each identity visited
+      // once. The count is a backstop for a blocker cargo names that is not in
+      // the lockfile at all, and it counts VISITS rather than dequeues — a
+      // shared layer is enqueued once per dependent, and charging those
+      // duplicates lets a wide fan-in exhaust the budget before the moved
+      // ancestor behind them ever reaches the front.
+      let visited = 0;
+      while (queue.length > 0 && visited <= newLock.packages.length) {
+        const blocker = queue.shift();
+        const at = `${blocker.name}@${blocker.version}`;
+        // Resolve cargo's prose to a package before anything else reads it.
+        // Zero or several and the walk does not guess — see `resolveBlocker`.
+        const found = resolveBlocker(blocker);
+        if (found.length !== 1) {
+          if (seen.has(at)) continue;
+          seen.add(at);
+          visited++;
+          skipped.push(
+            found.length === 0
+              ? `${at} — cargo named it, but no package in the lockfile matches`
+              : `${at} — ambiguous: ${found.length} packages share that name and version ` +
+                `(${found.map((o) => idOf(o)).join(", ")}), and cargo's error does not say ` +
+                "which refused; pinning the wrong one back would revert an unrelated update",
+          );
+          continue;
+        }
+        const [target] = found;
+        const id = idOf(target);
+        if (seen.has(id)) continue;
+        seen.add(id);
+        visited++;
+        // Only a package this batch MOVED can be pinned back, and only to
+        // the version it moved from — that is what "back" means here, and
+        // the diff is where it is recorded.
+        const pair = diff.changed.find((c) => idOf(c.after) === id);
+        if (pair === undefined) {
+          // No version to pin it back to — but that is a dead end only for
+          // THIS package, not for the walk. A parent that moved can have
+          // introduced the blocker: reverting the parent takes the blocker
+          // with it and frees the pin, and stopping here blocks a batch that
+          // had a route. So climb to whoever depends on it in the new graph
+          // and let them be tried the same way.
+          //
+          // Cargo names the chain only as far as the requirement it could
+          // not satisfy, so the reverse edges are read from the lockfile
+          // rather than from its error. Each is still visited once and the
+          // step bound is unchanged, so this widens what the walk reaches
+          // without widening how far it can run.
+          const dependents = newLock.packages.filter((o) =>
+            (o.dependencies ?? []).some((ref) => resolveDepRef([target], ref).length > 0),
+          );
+          for (const d of dependents) {
+            queue.push({ name: d.name, version: d.version, of: target });
+          }
+          skipped.push(
+            `${at} — this batch did not move it, so there is no version to pin back to` +
+              (dependents.length > 0
+                ? `; climbed to ${dependents.map((d) => `${d.name}@${d.version}`).join(", ")}`
+                : ""),
+          );
+          continue;
+        }
+        const aspec = specFor(pair.after);
+        const akey = `${aspec}@${pair.before.version}`;
+        if (applied.has(akey)) {
+          skipped.push(`${aspec} back to ${pair.before.version} — already pinned this run`);
+          continue;
+        }
+        if (refused.has(akey)) {
+          skipped.push(`${aspec} back to ${pair.before.version} — cargo already refused that this round`);
+          continue;
+        }
+        const attempt = runCargo(["update", aspec, "--precise", pair.before.version]);
+        if (attempt.ok) {
+          applied.add(akey);
+          pinnedHere.add(slotOf(pair.after, pair.before.version));
+          acted = true;
+          // The ancestor moved; the mover may not have. An exact `=` drags it
+          // back, but an ordinary range that merely EXCLUDED the old version
+          // does not: reverting a parent from `^2.1` to `^2.0` still admits
+          // the child locked at 2.1, so the crossing survives into the next
+          // round — where the mover's own pin is now permitted, because the
+          // requirement that refused it is gone. Nothing has to be undone for
+          // that retry to be allowed: the mover's refusal is this round's,
+          // and this pin ends the round.
+          //
+          // This cannot spin. A retry either succeeds (progress) or fails and
+          // walks again, and a walk only reaches ancestors this batch moved —
+          // a set the successful pins keep shrinking — with MAX_ROUNDS behind
+          // it either way.
+          //
+          // Which of the two happened is what every caller recording the
+          // REQUESTED package's own arrival has to know, so it is answered
+          // here rather than assumed: re-read, and look for the package AT
+          // THE TARGET this pin asked for.
+          //
+          // Asking the other question — is it still at the version we were
+          // moving it off — reads absence as arrival, and an ancestor revert
+          // can remove the package from the graph outright: reverting the
+          // parent that introduced a newly-added crate takes the crate with
+          // it. The report would then name a version of a package the
+          // lockfile does not contain at all.
+          //
+          // Matched on source identity as well as name: a crates.io copy and
+          // a git one can share a name, and a same-named package sitting at
+          // the target answers for a requested package that never moved. The
+          // identity is the source without its fragment, which is what stays
+          // put across a git restoration — the revision is the thing being
+          // changed.
+          //
+          // A git restoration pins to a revision rather than a version, so
+          // the target is matched against either. An unparseable lockfile
+          // answers "did not arrive" — the round loop throws on it a few
+          // lines later, and not writing a record beats writing one that
+          // cannot be confirmed.
+          const identity = sourceIdentityOf(pkg.source);
+          const afterAncestor = parseLockfile(readLockfile());
+          const reached =
+            afterAncestor.errors.length === 0 &&
+            afterAncestor.packages.some((o) => isAt(o, identity, pkg.name, to));
+          // Dragged back by the ancestor, so its version is this run's choice
+          // too; left where it was, and it is not.
+          if (reached) pinnedHere.add(slotOf(pkg, to));
+          return {
+            reached,
+            // The source travels with it for the same reason it travels with a
+            // crossing: `via` makes its own claim about its own package, and
+            // the claim cannot be checked against the final graph without one.
+            via: {
+              source: sourceIdentityOf(pair.after.source),
+              name: pair.after.name,
+              from: pair.after.version,
+              to: pair.before.version,
+            },
+          };
+        }
+        tried.push(`${aspec} back to ${pair.before.version} also failed:\n${attempt.output}`);
+        queue.push(...blockersFrom(attempt.output).map((b) => ({ ...b, of: pair.after })));
+      }
+      const trail = [
+        ...(tried.length > 0 ? ["the ancestors cargo named were tried too:", ...tried] : []),
+        ...(skipped.length > 0 ? ["ancestors cargo named that could not be pinned:", ...skipped] : []),
+      ];
+      block(
+        `${why} — and pinning ${spec} back to ${to} failed:\n${result.output}` +
+          (trail.length > 0 ? `\n${trail.join("\n")}` : ""),
+      );
       return false;
     };
     // The package-ID spec a pin names. Registry packages are unambiguous as
@@ -795,8 +1118,14 @@ export const updateLockfile = async ({
       const target = registry
         ? pair.before.version
         : ((pair.before.source ?? "").split("#")[1] ?? pair.before.version);
-      if (pin(specFor(pair.after), target, why)) {
-        restored.push({ name: pair.after.name, to: target });
+      const outcome = pin(pair.after, target, why);
+      if (outcome) {
+        if (outcome.reached)
+          restored.push({
+            source: sourceIdentityOf(pair.after.source),
+            name: pair.after.name,
+            to: target,
+          });
         break; // one pin per round — the graph must be re-read first
       }
     }
@@ -842,8 +1171,10 @@ export const updateLockfile = async ({
       const target = registry
         ? back.version
         : ((back.source ?? "").split("#")[1] ?? back.version);
-      if (pin(specFor(a), target, why)) {
-        restored.push({ name: a.name, to: target });
+      const outcome = pin(a, target, why);
+      if (outcome) {
+        if (outcome.reached)
+          restored.push({ source: sourceIdentityOf(a.source), name: a.name, to: target });
         break; // one pin per round
       }
     }
@@ -926,12 +1257,20 @@ export const updateLockfile = async ({
           continue;
         }
         crossings.push({
+          // The mover's source identity travels with the record: two copies of
+          // one crate from different sources can both cross, and every later
+          // comparison -- the dedup key, the `via` attach, the reconciliation
+          // against the shipped lockfile -- has to tell them apart.
+          source: sourceIdentityOf(pair.change.after.source),
           name: pair.change.name,
           from: pair.change.from,
           to: pair.change.to,
           dragged: { name, from: was, to: now },
         });
-        moverPins.set(`${pair.change.name}@${pair.change.to}`, {
+        // Keyed on the mover's identity, not its name and version: two copies
+        // of one crate from different sources can both cross in one round, and
+        // a shared key would drop one of their pins.
+        moverPins.set(idOf(pair.change.after), {
           pkg: pair.change.after,
           to: pair.change.from,
           why: crossing,
@@ -939,7 +1278,27 @@ export const updateLockfile = async ({
       }
     }
     for (const m of moverPins.values()) {
-      if (pin(specFor(m.pkg), m.to, m.why)) break; // one pin per round
+      const outcome = pin(m.pkg, m.to, m.why);
+      if (!outcome) continue;
+      // An ancestor pin reached the same result by a different route, so the
+      // report says so: the reader is owed the package that actually stayed
+      // behind, not just the one whose edge was refused. Only when the mover
+      // really stayed, though — an ancestor whose range merely excluded the
+      // old version leaves it where it was, and the crossing is re-derived
+      // next round with nothing held back yet.
+      //
+      // Matched on the compat group, not the bare name: two incompatible
+      // versions of one crate can both move and both cross, and stamping
+      // `via` by name alone tells the other group it was held back through
+      // an ancestor whose pin it never needed.
+      if (outcome.reached && outcome.via !== undefined) {
+        for (const x of crossings) {
+          if (x.source === sourceIdentityOf(m.pkg.source) && x.name === m.pkg.name && x.to === m.pkg.version) {
+            x.via = outcome.via;
+          }
+        }
+      }
+      break; // one pin per round
     }
     }
 
@@ -973,8 +1332,23 @@ export const updateLockfile = async ({
         // a dependent bumped in the same batch can have raised its floor
         // since, which is what makes the pin itself fallible.
         const target = candidate ?? c.from;
-        cooldown.push({ name: c.name, from: c.from, to: target === c.from ? null : target, reasons: [firstReason, ...reasons] });
-        if (pin(specFor(c.after), target, firstReason)) break; // one pin per round
+        // Recorded only once the pin lands. A refusal has already blocked
+        // the batch, and a deferral line for a package still sitting at the
+        // version the cooldown rejected tells the reader the opposite of
+        // what happened.
+        const outcome = pin(c.after, target, firstReason);
+        if (outcome) {
+          if (outcome.reached) {
+            cooldown.push({
+              source: sourceIdentityOf(c.after.source),
+              name: c.name,
+              from: c.from,
+              to: target === c.from ? null : target,
+              reasons: [firstReason, ...reasons],
+            });
+          }
+          break; // one pin per round
+        }
       }
       // Skip once a pin landed this round: the graph is stale, and a pin
       // that removed a freshly-added transitive would otherwise be judged
@@ -1009,8 +1383,19 @@ export const updateLockfile = async ({
           );
           continue;
         }
-        cooldown.push({ name: a.name, from: null, to: candidate, reasons: [firstReason, ...reasons] });
-        if (pin(specFor(a), candidate, firstReason)) break; // one pin per round
+        const outcome = pin(a, candidate, firstReason);
+        if (outcome) {
+          if (outcome.reached) {
+            cooldown.push({
+              source: sourceIdentityOf(a.source),
+              name: a.name,
+              from: null,
+              to: candidate,
+              reasons: [firstReason, ...reasons],
+            });
+          }
+          break; // one pin per round
+        }
       }
     }
 
@@ -1065,18 +1450,36 @@ export const updateLockfile = async ({
       }
       const newestCompat = stable.find((v) => compatKeyOf(v.vers) === compatKeyOf(pkg.version));
       if (newestCompat !== undefined && compareSemver(newestCompat.vers, pkg.version) > 0) {
-        // Newer, compatible, and not taken. Either the cooldown deferred
-        // it (already reported) or the manifest's requirement excludes it
-        // (an exact or bounded pin) — the date says which. With the
-        // cooldown disabled no date can excuse the miss, so it is the
-        // requirement's doing by elimination.
-        const deferred = cooldown.some((c) => c.name === name);
-        if (!deferred && cooldownDays <= 0) {
+        // Newer, compatible, and not taken. Three causes, and the report
+        // must not attribute one of them to another: this run pinned the
+        // package back itself, the cooldown deferred it, or the manifest's
+        // requirement excludes it.
+        //
+        // The first is the one the engine KNOWS, so it is checked rather
+        // than inferred by elimination -- and it is the one the elimination
+        // never covered. A crossing mover pinned back, or an ancestor rolled
+        // back to reach one, sits below its newest compatible release for
+        // this run's own reasons, and the date cannot tell that apart from a
+        // manifest bound: the report said "`a` stays at 1.2.0" under the
+        // crossings and "the manifest's requirement keeps 1.2.0" two
+        // sections later, in the same report, about the same package. The
+        // old `cooldown.some(...)` guard was this same test, keyed on a
+        // name and narrowed to one of the three causes.
+        //
+        // Silence is right here: wherever the pin came from -- `crossings`,
+        // `cooldown`, `unmanaged`, a blocking message -- already says why.
+        // The date then separates the other two, and with the cooldown
+        // disabled no date can excuse the miss, so it is the requirement's
+        // doing by elimination.
+        if (pinnedHere.has(slotOf(pkg, pkg.version))) {
+          // This run chose this version; nothing to attribute.
+        } else if (cooldownDays <= 0) {
           requirementHeld.push({ name, current: pkg.version, newest: newestCompat.vers });
-        } else if (!deferred) {
+        } else {
           const date = await versionDate(name, newestCompat.vers);
           if (date === null || date.getTime() > cutoff()) {
             cooldown.push({
+              source: sourceIdentityOf(pkg.source),
               name,
               from: pkg.version,
               to: null,
@@ -1097,7 +1500,10 @@ export const updateLockfile = async ({
   for (const pkg of newLock.packages) {
     if (pkg.source === null) continue; // the workspace's own packages
     if (pkg.source !== CRATES_IO_SOURCE) {
-      const wasRestored = restored.find((r) => r.name === pkg.name);
+      // By identity, not name: a git copy and a registry copy of one crate can
+      // both reach this loop, and a name lookup hands the first one's record
+      // to the second.
+      const wasRestored = restored.find((r) => isAt(pkg, r.source, r.name, r.to));
       unmanaged.push(
         wasRestored
           ? `${pkg.name} ${pkg.version}: source ${pkg.source} is not crates.io; ` +
@@ -1105,7 +1511,7 @@ export const updateLockfile = async ({
           : `${pkg.name} ${pkg.version}: source ${pkg.source} is not crates.io`,
       );
     } else if (!isStable(pkg.version)) {
-      const promoted = restored.find((r) => r.name === pkg.name);
+      const promoted = restored.find((r) => isAt(pkg, r.source, r.name, r.to));
       unmanaged.push(
         promoted
           ? `${pkg.name} ${pkg.version}: a pre-release pin; cargo update had promoted it ` +
@@ -1115,6 +1521,31 @@ export const updateLockfile = async ({
     }
   }
 
+  // Does the settled lockfile still bear out what a record CLAIMS? Every
+  // durable decision record -- one written in an earlier round and carried to
+  // the report -- asserts that some package ended at some version, and a later
+  // round can move the graph under it. An ancestor pin can remove the package
+  // outright; it can also leave a mover at `to` while incidentally undoing the
+  // crossing that justified holding it back, when reverting the parent moves
+  // the dragged dependency home. The detection was true when it was made and
+  // is not true of the lockfile that ships, and a report contradicting itself
+  // -- "`m` stays at 2.0.0" printed beside "Updated: `m` 2.0.0 → 2.1.0", or
+  // beside "Removed: `m`" -- is worse than one line short.
+  //
+  // Three findings in this one mechanism, so this is the predicate rather than
+  // a fourth per-record filter. Each earlier patch tested a proxy for the
+  // claim: first that the mover had not vanished, then that it sat at EITHER
+  // end -- which is precisely the case where it moved and the line is false.
+  // The claim itself is what gets checked, against the graph that shipped.
+  //
+  // Dropping a crossing loses nothing a reader sees. The one case where the
+  // mover legitimately ends at `to` is a crossing nothing could unwind, and
+  // that run BLOCKS: the crossing's own text is the blocking message, the CLI
+  // restores the lockfile and prints those rather than this report, and a
+  // batch that shipped is never the one whose mover stayed put.
+  const standsInFinalGraph = (source, name, version) =>
+    newLock.packages.some((o) => isAt(o, source, name, version));
+
   return {
     text: newText,
     oldText,
@@ -1122,14 +1553,52 @@ export const updateLockfile = async ({
     added: diff.added.map((p) => ({ name: p.name, version: p.version, direct: direct.has(p.name) })),
     removed: diff.removed.map((p) => ({ name: p.name, version: p.version })),
     held,
-    cooldown,
+    cooldown: cooldown.filter((c) => standsInFinalGraph(c.source, c.name, c.to ?? c.from)),
     requirementHeld,
     unmanaged,
     errors,
     // The fix-up loop re-derives its view each round (one pin per round),
     // so a crossing or violation persisting into a later round would
     // otherwise be reported once per round.
-    crossings: [...new Map(crossings.map((x) => [JSON.stringify(x), x])).values()],
+    // Keyed on the crossing itself, not the whole record: a crossing re-derived
+    // after an ancestor pin is the SAME one, and `via` gets attached to only
+    // one of the two copies — stringifying the record whole would render both.
+    // The copy that carries `via` is the one to keep; it says more.
+    crossings: [
+      ...crossings
+        // A crossing is a detection, recorded when it is detected; what it
+        // claims is that the mover STAYS AT `from`, so that is what is checked
+        // against the shipped lockfile -- see `standsInFinalGraph`.
+        .filter((x) => standsInFinalGraph(x.source, x.name, x.from))
+        // `via` is a durable record nested inside one, and it makes a claim of
+        // its own: the ancestor named is KEPT AT `via.to`. The graph can move
+        // under that after it is written, so it is checked separately -- the
+        // mover staying at `from` says nothing about where its ancestor ended
+        // up. Only the attribution is dropped when it no longer holds, never
+        // the crossing: "`m` stays at 2.0.0" is still true, and it is only the
+        // "held back through `p`, kept at 1.0.0" half that would contradict
+        // an Updated or Removed line about `p`.
+        .map((x) => {
+          if (x.via === undefined || standsInFinalGraph(x.via.source, x.via.name, x.via.to)) return x;
+          const { via, ...withoutVia } = x;
+          return withoutVia;
+        })
+        .reduce((byCrossing, x) => {
+          const key = JSON.stringify({
+            source: x.source,
+            name: x.name,
+            from: x.from,
+            to: x.to,
+            dragged: x.dragged,
+          });
+          const kept = byCrossing.get(key);
+          if (kept === undefined || (kept.via === undefined && x.via !== undefined)) {
+            byCrossing.set(key, x);
+          }
+          return byCrossing;
+        }, new Map())
+        .values(),
+    ],
     blocking: [...new Set(blocking)],
   };
 };
@@ -1168,7 +1637,11 @@ export const reportMarkdown = (report) => {
     for (const x of report.crossings) {
       lines.push(
         `- \`${x.name}\` stays at ${x.from}: ${x.to} moves \`${x.dragged.name}\` ` +
-          `from ${x.dragged.from} to ${x.dragged.to}`,
+          `from ${x.dragged.from} to ${x.dragged.to}` +
+          (x.via === undefined
+            ? ""
+            : ` — held back through \`${x.via.name}\`, kept at ${x.via.to}, ` +
+              "whose own requirement blocked pinning it directly"),
       );
     }
     lines.push("");

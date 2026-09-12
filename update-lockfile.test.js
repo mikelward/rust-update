@@ -8,6 +8,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   API_URL,
+  blockersFrom,
   CRATES_IO_SOURCE,
   INDEX_URL,
   compareSemver,
@@ -109,8 +110,18 @@ const makeCargo = (state, { updated, refuse, onPrecise } = {}) => {
       const bare = spec.includes("#") ? spec.slice(spec.indexOf("#") + 1) : spec;
       const [name, at] = bare.split("@");
       const to = args[3];
-      if (refuse && refuse(name, at, to)) {
-        return { ok: false, output: `error: failed to select a version for ${name}` };
+      // `refuse` may return a string to stand in for cargo's real error
+      // text — the ancestor walk reads its `required by package` lines, so a
+      // test about that needs the shape, not just the refusal.
+      const refused = refuse && refuse(name, at, to);
+      if (refused) {
+        return {
+          ok: false,
+          output:
+            typeof refused === "string"
+              ? refused
+              : `error: failed to select a version for ${name}`,
+        };
       }
       if (onPrecise) {
         state.text = onPrecise(name, at, to, state.text);
@@ -539,6 +550,1188 @@ test("a transitive major is unwound by pinning the dependent that dragged it", a
   assert.match(reportMarkdown(report), /would drag a transitive major/);
 });
 
+test("blockersFrom reads the packages cargo names as standing in the way", () => {
+  const output = [
+    "error: failed to select a version for the requirement `wbms = \"=0.2.128\"`",
+    "candidate versions found which didn't match: 0.2.127",
+    "required by package `wbm v0.2.128`",
+    "    ... which satisfies dependency `wbm = \"=0.2.128\"` of package `js-sys v0.3.105`",
+    "required by package `js-sys v0.3.105`",
+  ].join("\n");
+  assert.deepEqual(blockersFrom(output), [
+    { name: "wbm", version: "0.2.128" },
+    { name: "js-sys", version: "0.3.105" },
+  ]);
+  // Nothing to walk is an empty list, not a throw: a pin can be refused for
+  // reasons that name no package at all.
+  assert.deepEqual(blockersFrom("error: registry down"), []);
+  assert.deepEqual(blockersFrom(undefined), []);
+});
+
+test("a mover that cannot be pinned is unwound through the ancestor that pins it exactly", async () => {
+  // The wasm-bindgen shape: `p` requires `m` at an exact `=` version, so
+  // `cargo update --precise <old> m` is refused however correct it is. The
+  // reachable pin is p's, and it drags m back with it.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) =>
+        name === "m" &&
+        'error: failed to select a version for the requirement `m = "=2.1.0"`\n' +
+          "required by package `p v1.1.0`",
+      onPrecise: (name, _at, _to, text) => (name === "p" ? before : text),
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The refused mover pin is attempted first, then the ancestor's.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0",
+    "update p@1.1.0 --precise 1.0.0",
+  ]);
+  assert.deepEqual(report.changes, []);
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].name, "m");
+  assert.equal(report.crossings[0].dragged.name, "b");
+  // The report names the package that actually stayed behind, not only the
+  // one whose own pin was refused.
+  assert.deepEqual(report.crossings[0].via, {
+    source: CRATES_IO_SOURCE,
+    name: "p",
+    from: "1.1.0",
+    to: "1.0.0",
+  });
+  assert.match(
+    reportMarkdown(report),
+    /held back through `p`, kept at 1\.0\.0, whose own requirement blocked pinning it directly/,
+  );
+});
+
+test("the ancestor walk keeps climbing when the first ancestor is pinned exactly too", async () => {
+  // Two levels of exact pinning, which is the real wasm-bindgen chain:
+  // m is pinned by p1, and p1 is pinned by p2. Only p2's pin resolves.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p2"] },
+    reg({ name: "p2", version: "3.0.0", deps: ["p1"] }),
+    reg({ name: "p1", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p2"] },
+    reg({ name: "p2", version: "3.1.0", deps: ["p1"] }),
+    reg({ name: "p1", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) =>
+        (name === "m" && "required by package `p1 v1.1.0`") ||
+        (name === "p1" && "required by package `p2 v3.1.0`"),
+      onPrecise: (name, _at, _to, text) => (name === "p2" ? before : text),
+    },
+    {
+      p2: { versions: [{ vers: "3.0.0" }, { vers: "3.1.0" }], dates: { "3.1.0": OLD_DATE } },
+      p1: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0",
+    "update p1@1.1.0 --precise 1.0.0",
+    "update p2@3.1.0 --precise 3.0.0",
+  ]);
+  assert.equal(report.crossings.length, 1);
+  assert.deepEqual(report.crossings[0].via, {
+    source: CRATES_IO_SOURCE,
+    name: "p2",
+    from: "3.1.0",
+    to: "3.0.0",
+  });
+});
+
+test("an ancestor this batch did not move is not pinned, and the batch still blocks", async () => {
+  // The blocker cargo names is at its committed version, so there is no
+  // "back" to pin it to. Inventing one would be a downgrade nobody asked
+  // for, so the walk skips it and the refusal stands.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: after, refuse: (name) => name === "m" && "required by package `p v1.0.0`" },
+    {
+      p: { versions: [{ vers: "1.0.0" }], dates: {} },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /semver-incompatible move/);
+  // p is never pinned: the only pin attempted is the mover's own.
+  assert.deepEqual(cargo.calls, ["update", "update m@2.1.0 --precise 2.0.0"]);
+  // ...and the walk says so, rather than leaving the reader with only the
+  // mover's refusal and no sign the ancestor was considered.
+  assert.match(report.blocking[0], /ancestors cargo named that could not be pinned/);
+  assert.match(report.blocking[0], /p@1\.0\.0 — this batch did not move it/);
+});
+
+test("a non-exact ancestor revert frees the mover's own pin, which is retried", async () => {
+  // An exact `=` ancestor drags the mover back with it. An ordinary range
+  // that merely EXCLUDED the old version does not: reverting p's requirement
+  // still admits m at 2.1.0, so the crossing survives the ancestor pin — and
+  // m's own pin, refused a moment ago, is now permitted. The retry has to
+  // happen, or a batch one attempt from resolving blocks instead.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  // p reverted, m and b left exactly where the bulk resolve put them.
+  const afterAncestorPin = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      // m's pin is refused only while p still requires the newer version.
+      refuse: (name) =>
+        name === "m" && state.text === after && "required by package `p v1.1.0`",
+      onPrecise: (name, _at, _to, text) =>
+        name === "p" ? afterAncestorPin : name === "m" ? before : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused while p requires the new one
+    "update p@1.1.0 --precise 1.0.0", // the ancestor, which does not drag m
+    "update m@2.1.0 --precise 2.0.0", // retried, and now permitted
+  ]);
+  assert.deepEqual(report.changes, []);
+  // One crossing, not two: the re-derived copy is the same crossing, and only
+  // one of them carries `via`.
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].name, "m");
+  assert.equal(
+    reportMarkdown(report).match(/^- `m` stays at 2\.0\.0/gm).length,
+    1,
+  );
+});
+
+test("an ancestor pin that fails is named in the block, with cargo's reason", () => {
+  // The walk runs out: the only blocker moved, so it IS tried, and its pin
+  // fails with an error naming nothing further. Reporting just the mover's
+  // refusal would hide that p was attempted at all, and why it did not work.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) =>
+        (name === "m" && "required by package `p v1.1.0`") ||
+        (name === "p" && "error: the lock file needs to be updated but --locked was passed"),
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  return result.then((report) => {
+    assert.equal(report.blocking.length, 1);
+    assert.deepEqual(cargo.calls, [
+      "update",
+      "update m@2.1.0 --precise 2.0.0",
+      "update p@1.1.0 --precise 1.0.0",
+    ]);
+    assert.match(report.blocking[0], /the ancestors cargo named were tried too/);
+    assert.match(report.blocking[0], /p@1\.1\.0 back to 1\.0\.0 also failed/);
+    assert.match(report.blocking[0], /--locked was passed/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Pin bookkeeping: every record written where its outcome is known, and the
+// two outcomes living for different spans. `applied` is the run, `refused`
+// the round — a set that held both is what made an intermediate ancestor's
+// refusal outlive the graph it was judged against.
+// ---------------------------------------------------------------------------
+
+test("a refusal expires with its round, so a later ancestor attempt is retried not skipped", async () => {
+  // Two ancestors require m. In round one, q's pin is refused (p still wants
+  // the newer m) and p's succeeds. Round two re-derives the same crossing and
+  // reaches q again — now viable, because p has moved. Holding refusals for
+  // the run would meet it with "already pinned this run" and block a batch
+  // two attempts from resolving.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "q", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "q", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  // p reverted; q, m and b left where the bulk resolve put them.
+  const afterP = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "q", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) =>
+        (name === "m" &&
+          "required by package `q v1.1.0`\nrequired by package `p v1.1.0`") ||
+        // q cannot go back while p still requires the newer m.
+        (name === "q" && state.text === after && "required by package `p v1.1.0`"),
+      onPrecise: (name, _at, _to, text) =>
+        name === "p" ? afterP : name === "q" ? before : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused, naming q then p
+    "update q@1.1.0 --precise 1.0.0", // refused: p still requires the new m
+    "update p@1.1.0 --precise 1.0.0", // lands, ending the round
+    "update m@2.1.0 --precise 2.0.0", // round two: still refused
+    "update q@1.1.0 --precise 1.0.0", // retried against the new graph, and lands
+  ]);
+});
+
+test("a refusal is replayed within its own round rather than re-asked", async () => {
+  // m's crossing pin and its cooldown pin-back are the same request. The
+  // graph has not moved between them, so the answer cannot have changed:
+  // the second ask replays the recorded refusal instead of spending another
+  // cargo invocation reaching it, and still blocks.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["m"] },
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["m"] },
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: after, refuse: (name) => name === "m" && "error: no matching package" },
+    {
+      // 2.1.0 is fresh, so the cooldown wants it back at 2.0.0 too — the
+      // identical pin the crossing already asked for and was refused.
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.0.0": OLD_DATE, "2.1.0": FRESH_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(cargo.calls, ["update", "update m@2.1.0 --precise 2.0.0"]);
+  // Both asks are reported, and the replayed one carries cargo's reason.
+  assert.equal(report.blocking.length, 2);
+  assert.ok(report.blocking.every((b) => /no matching package/.test(b)));
+  assert.ok(report.blocking.some((b) => /semver-incompatible move/.test(b)));
+  assert.ok(report.blocking.some((b) => /inside the 5-day cooldown/.test(b)));
+});
+
+test("a cooldown deferral is recorded only once its pin lands", async () => {
+  // The pin is refused, so c is still sitting at the version the cooldown
+  // rejected. A "Deferred by the release-age cooldown" line for it would
+  // tell the reader the opposite of what happened.
+  const state = {
+    text: renderLock([
+      { name: "app", version: "0.0.0", deps: ["c"] },
+      reg({ name: "c", version: "1.0.0" }),
+    ]),
+  };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: renderLock([
+        { name: "app", version: "0.0.0", deps: ["c"] },
+        reg({ name: "c", version: "1.1.0" }),
+      ]),
+      refuse: (name) => name === "c" && "error: failed to select a version",
+    },
+    { c: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.0.0": OLD_DATE, "1.1.0": FRESH_DATE } } },
+  );
+  const report = await result;
+  // The pin really was attempted and really was refused — without this the
+  // empty cooldown below would pass for the wrong reason.
+  assert.deepEqual(cargo.calls, ["update", "update c@1.1.0 --precise 1.0.0"]);
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /inside the 5-day cooldown/);
+  assert.deepEqual(report.cooldown, []);
+  assert.doesNotMatch(reportMarkdown(report), /Deferred by the release-age cooldown/);
+});
+
+test("a pin cargo accepts but that moves nothing blocks instead of looping", async () => {
+  // The run-scoped half of the split. Cargo reports success and changes
+  // nothing, so the next round re-derives the identical violation and asks
+  // for the identical pin. That ask is the evidence the fix did not take:
+  // it blocks, rather than spending every remaining round re-asking.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["m"] },
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["m"] },
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: after, onPrecise: (_name, _at, _to, text) => text }, // accepted, no-op
+    {
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  // Asked once. The second round recognizes the repeat without cargo.
+  assert.deepEqual(cargo.calls, ["update", "update m@2.1.0 --precise 2.0.0"]);
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /semver-incompatible move/);
+  assert.doesNotMatch(report.blocking[0], /did not settle in/);
+});
+
+test("an ancestor pin that does not drag the cooling package records no deferral yet", async () => {
+  // `pin()` landing is not the same fact as the requested package moving.
+  // Here p's revert succeeds but its range still admits c at 1.1.0, so c is
+  // exactly where the cooldown rejected it. Recording the deferral on the
+  // ancestor's success writes it once here and again next round, when c's
+  // own pin finally lands — the report then defers the same package twice.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["c"] }),
+    reg({ name: "c", version: "1.0.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.1.0", deps: ["c"] }),
+    reg({ name: "c", version: "1.1.0" }),
+  ]);
+  // p reverted, c left at the version the cooldown rejected.
+  const afterP = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p"] },
+    reg({ name: "p", version: "1.0.0", deps: ["c"] }),
+    reg({ name: "c", version: "1.1.0" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) =>
+        name === "c" && state.text === after && "required by package `p v1.1.0`",
+      onPrecise: (name, _at, _to, text) =>
+        name === "p" ? afterP : name === "c" ? before : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      c: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.0.0": OLD_DATE, "1.1.0": FRESH_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The ancestor path really was taken — without this the count below could
+  // pass on a fixture that never reached it.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update c@1.1.0 --precise 1.0.0", // refused while p requires the new c
+    "update p@1.1.0 --precise 1.0.0", // lands, but does not drag c
+    "update c@1.1.0 --precise 1.0.0", // round two: c's own pin, which does
+  ]);
+  assert.equal(report.cooldown.length, 1);
+  assert.equal(report.cooldown[0].name, "c");
+  assert.equal(reportMarkdown(report).match(/^- `c` stays at 1\.0\.0/gm).length, 1);
+});
+
+test("an ancestor hold-back is attributed to its own compatibility group only", async () => {
+  // Two incompatible versions of one crate both move and both cross. m 1.x is
+  // held back through p; m 2.x needs no ancestor and is pinned directly.
+  // Stamping `via` by bare name tells m 2.x it was held back through p, which
+  // it never was — and the crossing dedup keeps the copy carrying `via`, so
+  // the wrong attribution is the one that reaches the report.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m 1.0.0"] }),
+    reg({ name: "q", version: "1.0.0", deps: ["m 2.0.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["b"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["d"] }),
+    reg({ name: "b", version: "1.4.0" }),
+    reg({ name: "d", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.1.0", deps: ["m 1.1.0"] }),
+    reg({ name: "q", version: "1.1.0", deps: ["m 2.1.0"] }),
+    reg({ name: "m", version: "1.1.0", deps: ["b"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["d"] }),
+    reg({ name: "b", version: "2.0.1" }),
+    reg({ name: "d", version: "2.0.1" }),
+  ]);
+  // p's requirement is exact, so reverting it drags m 1.x — and b with it.
+  const afterP = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m 1.0.0"] }),
+    reg({ name: "q", version: "1.1.0", deps: ["m 2.1.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["b"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["d"] }),
+    reg({ name: "b", version: "1.4.0" }),
+    reg({ name: "d", version: "2.0.1" }),
+  ]);
+  // m 2.x pins back on its own, needing no ancestor at all.
+  const settled = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "q"] },
+    reg({ name: "p", version: "1.0.0", deps: ["m 1.0.0"] }),
+    reg({ name: "q", version: "1.1.0", deps: ["m 2.0.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["b"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["d"] }),
+    reg({ name: "b", version: "1.4.0" }),
+    reg({ name: "d", version: "1.4.0" }),
+  ]);
+  const state = { text: before };
+  const { result } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name, at) =>
+        name === "m" && at === "1.1.0" && "required by package `p v1.1.0`",
+      onPrecise: (name, at, _to, text) =>
+        name === "p" ? afterP : name === "m" && at === "2.1.0" ? settled : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: {
+        versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }, { vers: "2.0.0" }, { vers: "2.1.0" }],
+        dates: { "1.1.0": OLD_DATE, "2.1.0": OLD_DATE },
+      },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+      d: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  return result.then((report) => {
+    assert.deepEqual(report.blocking, []);
+    const one = report.crossings.find((x) => x.to === "1.1.0");
+    const two = report.crossings.find((x) => x.to === "2.1.0");
+    // Both groups really did cross — otherwise the `via` checks below would
+    // pass against a fixture that only ever produced one crossing.
+    assert.ok(one !== undefined && two !== undefined);
+    assert.equal(one.via?.name, "p");
+    assert.equal(two.via, undefined);
+  });
+});
+
+test("a restoration is not claimed when only an ancestor moved", async () => {
+  // Same conflation on the restoration path. `restored` is read with `.find`,
+  // so a duplicate entry is invisible — what shows is the false claim. p's
+  // revert lands but leaves the git dependency on the advanced revision, the
+  // batch then blocks with it still at bbbb222, and a report saying it "was
+  // restored to aaaa111" describes a lockfile that does not exist.
+  const gitOld = "git+https://github.com/example/vendored?branch=main#aaaa111";
+  const gitNew = "git+https://github.com/example/vendored?branch=main#bbbb222";
+  const at = (source, p) =>
+    renderLock([
+      { name: "app", version: "0.0.0", deps: ["vendored", "p"] },
+      { name: "vendored", version: "0.3.0", source },
+      reg({ name: "p", version: p, deps: ["vendored"] }),
+    ]);
+  const state = { text: at(gitOld, "1.0.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: at(gitNew, "1.1.0"), // the branch advanced and p moved with it
+      refuse: (name) => name === "vendored" && "required by package `p v1.1.0`",
+      // p reverts, but its requirement still admits the advanced revision.
+      onPrecise: (name, _at, _to, text) => (name === "p" ? at(gitNew, "1.0.0") : text),
+    },
+    { p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } } },
+  );
+  const report = await result;
+  // The ancestor pin really did land, and vendored really was left behind.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update git+https://github.com/example/vendored?branch=main#vendored@0.3.0 --precise aaaa111",
+    "update p@1.1.0 --precise 1.0.0", // lands, does not drag vendored
+    "update git+https://github.com/example/vendored?branch=main#vendored@0.3.0 --precise aaaa111",
+  ]);
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.unmanaged.join("\n"), /vendored 0\.3\.0: source .*is not crates\.io/);
+  assert.doesNotMatch(report.unmanaged.join("\n"), /restored to/);
+});
+
+test("a package the ancestor revert deleted is not reported as having taken a version", async () => {
+  // Absence is not arrival. Reverting q takes the crate it introduced with
+  // it, so n is gone from the lockfile entirely — asking "is n still at
+  // 1.1.0" answers no and reads as success, and the report then names a
+  // version of a package the lockfile does not contain.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q"] },
+    reg({ name: "q", version: "1.0.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q"] },
+    reg({ name: "q", version: "1.1.0", deps: ["n"] }),
+    reg({ name: "n", version: "1.1.0" }), // new arrival, inside the cooldown
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "n" && "required by package `q v1.1.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? before : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      n: {
+        versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }],
+        dates: { "1.0.0": OLD_DATE, "1.1.0": FRESH_DATE },
+      },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // n's own pin was refused and q's revert is what landed — without this the
+  // empty cooldown below could pass on a fixture that never got that far.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update n@1.1.0 --precise 1.0.0", // refused: q requires the new n
+    "update q@1.1.0 --precise 1.0.0", // lands, and takes n out of the graph
+  ]);
+  assert.deepEqual(report.cooldown, []);
+  assert.doesNotMatch(reportMarkdown(report), /Deferred by the release-age cooldown/);
+});
+
+test("the walk climbs past a blocker this batch added rather than moved", async () => {
+  // p is new in this batch, so there is no version to pin it back to — but
+  // that is a dead end for p, not for the walk. q introduced p, and
+  // reverting q removes it, which is the only route to pinning m back.
+  // Stopping at p blocks a batch that had one.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.1.0", deps: ["p"] }),
+    reg({ name: "p", version: "1.0.0", deps: ["m"] }), // newly added blocker
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `p v1.0.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? before : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      p: { versions: [{ vers: "1.0.0" }], dates: { "1.0.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused, naming p — which this batch added
+    "update q@1.1.0 --precise 1.0.0", // reached by climbing p's reverse edge
+  ]);
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].via?.name, "q");
+});
+
+test("a same-named package from another source does not answer for the requested one", async () => {
+  // A git copy of dupe sits at exactly the version the registry copy is being
+  // pinned back to. Matching on name and version alone lets it answer for a
+  // registry copy that never moved, so the deferral is recorded here and
+  // again next round when the real pin lands.
+  const g = "git+https://github.com/x/dupe?rev=x#abc1234";
+  const at = (p, crates) =>
+    renderLock([
+      {
+        name: "app",
+        version: "0.0.0",
+        deps: ["p", `dupe 2.0.4 (${g})`],
+      },
+      reg({ name: "p", version: p, deps: [`dupe ${crates} (${CRATES_IO_SOURCE})`] }),
+      reg({ name: "dupe", version: crates }),
+      { name: "dupe", version: "2.0.4", source: g },
+    ]);
+  const state = { text: at("1.0.0", "2.0.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: at("1.1.0", "2.0.5"),
+      refuse: (name, v) =>
+        name === "dupe" && v === "2.0.5" && state.text === at("1.1.0", "2.0.5") &&
+        "required by package `p v1.1.0`",
+      // p reverts without dragging the registry dupe, which stays at 2.0.5 —
+      // while the git dupe has been sitting at 2.0.4 the whole time.
+      onPrecise: (name, _v, _to, text) =>
+        name === "p" ? at("1.0.0", "2.0.5") : name === "dupe" ? at("1.0.0", "2.0.4") : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      dupe: {
+        versions: [{ vers: "2.0.0" }, { vers: "2.0.4" }, { vers: "2.0.5" }],
+        dates: { "2.0.4": OLD_DATE, "2.0.5": FRESH_DATE },
+      },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The ancestor really did land while the registry dupe stayed put.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update dupe@2.0.5 --precise 2.0.4", // refused: p requires the new one
+    "update p@1.1.0 --precise 1.0.0", // lands, does not drag the registry dupe
+    "update dupe@2.0.5 --precise 2.0.4", // round two: the real pin
+  ]);
+  assert.equal(report.cooldown.length, 1);
+  // Deferred once, not once per round. (`dupe` also appears under Updated,
+  // so the match is scoped to the cooldown line's own wording.)
+  assert.equal(reportMarkdown(report).match(/^- `dupe` took 2\.0\.4, newer/gm).length, 1);
+});
+
+test("an ambiguous blocker is narrowed by the edge it refused on", async () => {
+  // Cargo names the blocker in prose — `required by package `d v1.0.1`` — and
+  // two packages answer to that: a registry d this batch moved, and a git d
+  // that has held still. Only the git one depends on m, so only it can be
+  // what refused m's pin. Taking the name and version at face value finds the
+  // registry one in the diff and reverts a perfectly good update.
+  const gitD = "git+https://github.com/example/d?rev=x#abc1234";
+  const lock = (d, m, b) =>
+    renderLock([
+      { name: "app", version: "0.0.0", deps: ["p", "g"] },
+      reg({ name: "p", version: "1.0.0", deps: [`d ${d} (${CRATES_IO_SOURCE})`] }),
+      reg({ name: "g", version: "1.0.0", deps: [`d 1.0.1 (${gitD})`] }),
+      reg({ name: "d", version: d }),
+      { name: "d", version: "1.0.1", source: gitD, deps: ["m"] },
+      reg({ name: "m", version: m, deps: ["b"] }),
+      reg({ name: "b", version: b }),
+    ]);
+  const state = { text: lock("1.0.0", "2.0.0", "1.4.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: lock("1.0.1", "2.1.0", "2.0.1"),
+      refuse: (name, v) => name === "m" && v === "2.1.0" && "required by package `d v1.0.1`",
+    },
+    {
+      d: { versions: [{ vers: "1.0.0" }, { vers: "1.0.1" }], dates: { "1.0.1": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  // The walk reaches the git copy, finds no version to pin it back to, and
+  // climbs — it never asks cargo to revert the registry copy.
+  assert.deepEqual(cargo.calls, ["update", "update m@2.1.0 --precise 2.0.0"]);
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /climbed to g@1\.0\.0/);
+});
+
+test("a blocker two sources answer to, both carrying the edge, blocks instead of guessing", async () => {
+  // The same shape, except the registry d depends on m too, so the edge
+  // narrows nothing. Cargo's error does not say which one refused, and
+  // pinning the wrong one back would revert an unrelated update — so the walk
+  // declines to route through it and says why.
+  const gitD = "git+https://github.com/example/d?rev=x#abc1234";
+  const lock = (d, m, b) =>
+    renderLock([
+      { name: "app", version: "0.0.0", deps: ["p", "g"] },
+      reg({ name: "p", version: "1.0.0", deps: [`d ${d} (${CRATES_IO_SOURCE})`] }),
+      reg({ name: "g", version: "1.0.0", deps: [`d 1.0.1 (${gitD})`] }),
+      reg({ name: "d", version: d, deps: ["m"] }),
+      { name: "d", version: "1.0.1", source: gitD, deps: ["m"] },
+      reg({ name: "m", version: m, deps: ["b"] }),
+      reg({ name: "b", version: b }),
+    ]);
+  const state = { text: lock("1.0.0", "2.0.0", "1.4.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: lock("1.0.1", "2.1.0", "2.0.1"),
+      refuse: (name, v) => name === "m" && v === "2.1.0" && "required by package `d v1.0.1`",
+    },
+    {
+      d: { versions: [{ vers: "1.0.0" }, { vers: "1.0.1" }], dates: { "1.0.1": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(cargo.calls, ["update", "update m@2.1.0 --precise 2.0.0"]);
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /d@1\.0\.1 — ambiguous: 2 packages/);
+  assert.match(report.blocking[0], /#d@1\.0\.1/); // the candidates, by package ID
+});
+
+test("a wide fan-in of added packages does not exhaust the walk before the mover's parent", async () => {
+  // q moved and brought a whole subtree with it: h blocks m's pin, and the
+  // only route is reverting q. Every D depends on h and is depended on by A,
+  // so visiting the Ds enqueues A once each — seven duplicates that sit in
+  // front of q. Charging those to the step budget spends it before q is ever
+  // dequeued, and the batch blocks with the route still there.
+  //
+  // Sized so the difference is real rather than decorative: 13 packages, so
+  // the old dequeue-counting bound allowed 14 iterations and q's turn came
+  // seventeenth. Counting visits, q is the tenth.
+  const ds = [1, 2, 3, 4, 5, 6, 7].map((n) => `d${n}`);
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    // q must NOT depend on h directly, or the climb finds it on the first
+    // step and the fan-in below is never walked.
+    reg({ name: "q", version: "1.1.0", deps: ["a"] }),
+    // The Ds are rendered before A on purpose: dependents are read in
+    // lockfile order, so this is what puts the duplicates ahead of q.
+    ...ds.map((d) => reg({ name: d, version: "1.0.0", deps: ["h"] })),
+    reg({ name: "a", version: "1.0.0", deps: ["h", ...ds] }),
+    reg({ name: "h", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `h v1.0.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? before : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused, naming h — which this batch added
+    "update q@1.1.0 --precise 1.0.0", // reached past seven duplicate enqueues of a
+  ]);
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].via?.name, "q");
+});
+
+test("a crossing whose mover the revert removed is not reported as held back", async () => {
+  // r dropped its old edge to m in the bulk resolve and q picked one up, so
+  // reverting q leaves m with no dependents at all and it is pruned. The
+  // detection was true when it was made; the lockfile that ships contains no
+  // m, and a report saying "`m` stays at 2.0.0" next to "Removed: `m`"
+  // contradicts itself.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "r"] },
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "r", version: "1.0.0", deps: ["m"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "r"] },
+    reg({ name: "q", version: "1.1.0", deps: ["m"] }),
+    reg({ name: "r", version: "1.1.0" }), // dropped its edge to m
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  // q reverted; nothing depends on m now, so m and b are gone.
+  const afterQ = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "r"] },
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "r", version: "1.1.0" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `q v1.1.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? afterQ : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      r: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The crossing really was detected and the revert really did remove m —
+  // without these the empty crossings below could pass for the wrong reason.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused, naming q
+    "update q@1.1.0 --precise 1.0.0", // lands, and m loses its last dependent
+  ]);
+  assert.ok(report.removed.some((p) => p.name === "m"));
+  assert.deepEqual(report.crossings, []);
+  assert.doesNotMatch(reportMarkdown(report), /Held back — would drag a transitive major/);
+});
+
+test("a same-named package from another source does not keep a removed crossing alive", async () => {
+  // As above, but a git copy of m sits in the graph the whole time at exactly
+  // the version the crossing names. Reconciling the detection against the
+  // shipped lockfile by name and version alone finds that copy and keeps the
+  // crossing, so the report claims the registry m stayed at 2.0.0 while also
+  // listing it as removed.
+  const gitM = "git+https://github.com/example/m?rev=x#abc1234";
+  const app = { name: "app", version: "0.0.0", deps: ["q", "r", `m 2.0.0 (${gitM})`] };
+  const gitCopy = { name: "m", version: "2.0.0", source: gitM };
+  const before = renderLock([
+    app,
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "r", version: "1.0.0", deps: [`m 2.0.0 (${CRATES_IO_SOURCE})`] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b"] }),
+    reg({ name: "b", version: "1.4.0" }),
+    gitCopy,
+  ]);
+  const after = renderLock([
+    app,
+    reg({ name: "q", version: "1.1.0", deps: [`m 2.1.0 (${CRATES_IO_SOURCE})`] }),
+    reg({ name: "r", version: "1.1.0" }), // dropped its edge to m
+    reg({ name: "m", version: "2.1.0", deps: ["b"] }),
+    reg({ name: "b", version: "2.0.1" }),
+    gitCopy,
+  ]);
+  // q reverted; nothing depends on the registry m now, so it and b are gone —
+  // and the git copy, which never moved, is still sitting at 2.0.0.
+  const afterQ = renderLock([
+    app,
+    reg({ name: "q", version: "1.0.0" }),
+    reg({ name: "r", version: "1.1.0" }),
+    gitCopy,
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `q v1.1.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? afterQ : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      r: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The crossing really was detected and the revert really did remove the
+  // registry m — without these the empty crossings below could pass for the
+  // wrong reason.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    // The bare spec is unambiguous: the git copy is at 2.0.0, not 2.1.0.
+    "update m@2.1.0 --precise 2.0.0", // refused, naming q
+    "update q@1.1.0 --precise 1.0.0", // lands, and the registry m loses its last dependent
+  ]);
+  assert.ok(report.removed.some((p) => p.name === "m"));
+  // The git copy is still there, at the version the crossing named.
+  assert.ok(report.unmanaged.some((u) => u.startsWith("m 2.0.0: source git+")));
+  assert.deepEqual(report.crossings, []);
+  assert.doesNotMatch(reportMarkdown(report), /Held back — would drag a transitive major/);
+});
+
+test("a crossing the ancestor pin undid is not reported against a mover that moved", async () => {
+  // q and m both cross on their edge to b. Reverting q takes b back to 1.4.0,
+  // which m's own range admits — so m keeps 2.1.0 and its edge no longer
+  // crosses anything. q's record is true of the lockfile that ships; m's is
+  // not, and "`m` stays at 2.0.0" printed beside "Updated: `m` 2.0.0 → 2.1.0"
+  // is the report contradicting itself. Testing that the mover is merely
+  // PRESENT keeps it, since 2.1.0 is the crossing's own `to`.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.0.0", deps: ["b 1.4.0"] }),
+    reg({ name: "m", version: "2.0.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.1.0", deps: ["b 2.0.1"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b 2.0.1"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  // q back at 1.0.0 stops holding b up; m stays where it is and takes 1.4.0.
+  const afterQ = renderLock([
+    { name: "app", version: "0.0.0", deps: ["q", "m"] },
+    reg({ name: "q", version: "1.0.0", deps: ["b 1.4.0"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const state = { text: before };
+  const { result } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `q v1.1.0`",
+      onPrecise: (name, _at, _to, text) => (name === "q" ? afterQ : text),
+    },
+    {
+      q: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // m really did end up updated — without this the dropped crossing below
+  // could pass for the wrong reason.
+  assert.deepEqual(report.changes, [{ name: "m", from: "2.0.0", to: "2.1.0", direct: true }]);
+  // q stayed, so its crossing still describes the lockfile that ships.
+  assert.deepEqual(
+    report.crossings.map((x) => x.name),
+    ["q"],
+  );
+  const markdown = reportMarkdown(report);
+  assert.match(markdown, /^- `q` stays at 1\.0\.0/m);
+  assert.doesNotMatch(markdown, /`m` stays at/);
+});
+
+test("a cooldown deferral a later round removed is not reported", async () => {
+  // Round 1 has no crossing, so the cooldown runs: c arrives too new and is
+  // pinned back to 1.0.0, which is recorded. That pin is what puts b up to
+  // 2.0.1, so round 2 finds m crossing; m's own pin is refused, p is reverted
+  // instead, and p was c's only dependent — c leaves the graph entirely. The
+  // deferral was true when it was written and describes nothing that shipped.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "m"] },
+    reg({ name: "p", version: "1.0.0" }),
+    reg({ name: "m", version: "2.0.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "m"] },
+    reg({ name: "p", version: "1.1.0", deps: ["c"] }),
+    reg({ name: "c", version: "1.1.0" }), // new, and inside the cooldown
+    reg({ name: "m", version: "2.1.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  // c 1.0.0 needs b 2.x, which drags m's edge across — the crossing round 1
+  // could not have seen.
+  const afterC = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "m"] },
+    reg({ name: "p", version: "1.1.0", deps: ["c"] }),
+    reg({ name: "c", version: "1.0.0", deps: ["b 2.0.1"] }),
+    reg({ name: "m", version: "2.1.0", deps: ["b 2.0.1"] }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  // Reverting p takes c with it, and b goes back down.
+  const afterP = renderLock([
+    { name: "app", version: "0.0.0", deps: ["p", "m"] },
+    reg({ name: "p", version: "1.0.0" }),
+    reg({ name: "m", version: "2.1.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: after,
+      refuse: (name) => name === "m" && "required by package `p v1.1.0`",
+      onPrecise: (name, _at, _to, text) =>
+        name === "c" ? afterC : name === "p" ? afterP : text,
+    },
+    {
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      c: {
+        versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }],
+        dates: { "1.0.0": OLD_DATE, "1.1.0": FRESH_DATE },
+      },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The cooldown really did defer c and the revert really did remove it —
+  // without these the empty cooldown below could pass for the wrong reason.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update c@1.1.0 --precise 1.0.0", // round 1: the deferral, recorded
+    "update m@2.1.0 --precise 2.0.0", // round 2: refused, naming p
+    "update p@1.1.0 --precise 1.0.0", // p reverted, and c goes with it
+  ]);
+  assert.ok(!report.added.some((a) => a.name === "c"));
+  assert.ok(!report.removed.some((r) => r.name === "c"));
+  assert.deepEqual(report.cooldown, []);
+  // p sits at 1.0.0 because this run rolled it back, not because app's
+  // manifest bounds it — 1.1.0 is aged and would otherwise be attributed.
+  assert.deepEqual(report.requirementHeld, []);
+  const markdown = reportMarkdown(report);
+  assert.doesNotMatch(markdown, /Deferred by the release-age cooldown/);
+  assert.doesNotMatch(markdown, /Held by the manifest requirement/);
+});
+
+test("an attribution whose ancestor moved again is dropped, and only it", async () => {
+  // Round 1 unwinds m's crossing through p, so the crossing is credited to p
+  // "kept at 1.0.0". Round 2's git restore re-resolves p up to 1.2.0 — the
+  // ancestor is not where the attribution says it is, and the report would
+  // print "held back through `p`, kept at 1.0.0" beside "Updated: `p` 1.0.0 →
+  // 1.2.0". `via` is a durable record nested inside one, so validating the
+  // crossing's own claim says nothing about it.
+  const gitOld = "git+https://github.com/example/v?branch=main#aaaa111";
+  const gitNew = "git+https://github.com/example/v?branch=main#bbbb222";
+  const lock = (git, p, m, b) =>
+    renderLock([
+      { name: "app", version: "0.0.0", deps: [`v 0.3.0 (${git})`, "p", "m"] },
+      { name: "v", version: "0.3.0", source: git },
+      reg({ name: "p", version: p, deps: ["m"] }),
+      reg({ name: "m", version: m, deps: [`b ${b}`] }),
+      reg({ name: "b", version: b }),
+    ]);
+  const state = { text: lock(gitOld, "1.0.0", "2.0.0", "1.4.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: lock(gitOld, "1.1.0", "2.1.0", "2.0.1"),
+      refuse: (name) => name === "m" && "required by package `p v1.1.0`",
+      onPrecise: (name, _at, _to, text) =>
+        // Reverting p drags m back — and moves v's branch selection on.
+        name === "p"
+          ? lock(gitNew, "1.0.0", "2.0.0", "1.4.0")
+          : // Restoring v re-resolves p upward again.
+            name === "v"
+            ? lock(gitOld, "1.2.0", "2.0.0", "1.4.0")
+            : text,
+    },
+    {
+      p: {
+        versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }, { vers: "1.2.0" }],
+        dates: { "1.1.0": OLD_DATE, "1.2.0": OLD_DATE },
+      },
+      m: { versions: [{ vers: "2.0.0" }, { vers: "2.1.0" }], dates: { "2.1.0": OLD_DATE } },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The attribution really was recorded, and p really did move off it.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update m@2.1.0 --precise 2.0.0", // refused, naming p
+    "update p@1.1.0 --precise 1.0.0", // lands, drags m back — `via` recorded here
+    "update git+https://github.com/example/v?branch=main#v@0.3.0 --precise aaaa111",
+  ]);
+  assert.deepEqual(report.changes, [{ name: "p", from: "1.0.0", to: "1.2.0", direct: true }]);
+  // The crossing's own claim still holds: m did stay at 2.0.0.
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].name, "m");
+  assert.equal(report.crossings[0].via, undefined);
+  const markdown = reportMarkdown(report);
+  assert.match(markdown, /^- `m` stays at 2\.0\.0: 2\.1\.0 moves `b` from 1\.4\.0 to 2\.0\.1$/m);
+  assert.doesNotMatch(markdown, /held back through/);
+});
+
 test("a crossed edge on an unchanged package blocks instead of guessing", async () => {
   // b crosses majors but its only dependent is the workspace member, which
   // never changes — nothing to pin, so the batch must stop.
@@ -595,6 +1788,49 @@ test("a crossing hidden behind a surviving old major is still unwound", async ()
   assert.equal(report.crossings[0].dragged.from, "1.4.0");
 });
 
+test("a mover this run pinned back is not blamed on the manifest requirement", async () => {
+  // a is held back because its 1.3.0 would drag b across a major — this
+  // engine's own decision, already printed under the crossings. Attributing
+  // the miss by elimination ("not deferred, and the release is aged, so the
+  // manifest must exclude it") never eliminates the engine itself, so the
+  // same report told the reader to loosen a requirement that is holding
+  // nothing: "`a` stays at 1.2.0" and "the manifest's requirement keeps
+  // 1.2.0", two sections apart, about one package.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["a", "keeper"] },
+    reg({ name: "a", version: "1.2.0", deps: ["b 1.4.0"] }),
+    reg({ name: "keeper", version: "3.1.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: ["a", "keeper"] },
+    reg({ name: "a", version: "1.3.0", deps: ["b 2.0.1"] }),
+    reg({ name: "keeper", version: "3.1.0", deps: ["b 1.4.0"] }),
+    reg({ name: "b", version: "1.4.0" }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: after, onPrecise: () => before },
+    {
+      a: { versions: [{ vers: "1.2.0" }, { vers: "1.3.0" }], dates: { "1.3.0": OLD_DATE } },
+      keeper: { versions: [{ vers: "3.1.0" }], dates: {} },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // a really was pinned back by this run, and 1.3.0 really is aged — so the
+  // elimination would reach the manifest if nothing stopped it.
+  assert.deepEqual(cargo.calls, ["update", "update a@1.3.0 --precise 1.2.0"]);
+  assert.equal(report.crossings.length, 1);
+  assert.deepEqual(report.requirementHeld, []);
+  const markdown = reportMarkdown(report);
+  assert.match(markdown, /^- `a` stays at 1\.2\.0/m);
+  assert.doesNotMatch(markdown, /Held by the manifest requirement/);
+});
+
 test("dual renamed edges to one crate are not misread as a crossing", async () => {
   // `a` depends on b 1.x AND b 2.x at once (renamed dependencies). An
   // unrelated package moves; the dual edges hold still. A by-name edge map
@@ -617,6 +1853,48 @@ test("dual renamed edges to one crate are not misread as a crossing", async () =
   assert.deepEqual(report.crossings, []);
   assert.deepEqual(cargo.calls, ["update"]);
   assert.deepEqual(report.changes.map((c) => c.name), ["other"]);
+});
+
+test("pinning one compatibility group does not silence the other's hold-back", async () => {
+  // Renamed dependencies put a 1.x and a 2.x copy of `a` in one graph. This
+  // run pins the 1.x copy back (its 1.3.0 would drag b across a major); the
+  // 2.x copy never moved and its 2.1.0 is aged, so the manifest really is what
+  // keeps it — an actionable line the reader needs. Keyed on the crate alone,
+  // the 1.x pin answers for the 2.x copy and that line disappears.
+  const dual = [`a 1.2.0 (${CRATES_IO_SOURCE})`, `a 2.0.0 (${CRATES_IO_SOURCE})`];
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: dual },
+    reg({ name: "a", version: "1.2.0", deps: ["b 1.4.0"] }),
+    reg({ name: "a", version: "2.0.0" }),
+    reg({ name: "b", version: "1.4.0" }),
+  ]);
+  const after = renderLock([
+    { name: "app", version: "0.0.0", deps: [`a 1.3.0 (${CRATES_IO_SOURCE})`, `a 2.0.0 (${CRATES_IO_SOURCE})`] },
+    reg({ name: "a", version: "1.3.0", deps: ["b 2.0.1"] }),
+    reg({ name: "a", version: "2.0.0" }),
+    reg({ name: "b", version: "1.4.0" }),
+    reg({ name: "b", version: "2.0.1" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: after, onPrecise: () => before },
+    {
+      a: {
+        versions: [{ vers: "1.2.0" }, { vers: "1.3.0" }, { vers: "2.0.0" }, { vers: "2.1.0" }],
+        dates: { "1.3.0": OLD_DATE, "2.1.0": OLD_DATE },
+      },
+      b: { versions: [{ vers: "1.4.0" }, { vers: "2.0.1" }], dates: { "2.0.1": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The 1.x copy really was pinned back, so there is a record to over-apply.
+  // The bare spec is unambiguous: only one package is at 1.3.0.
+  assert.deepEqual(cargo.calls, ["update", "update a@1.3.0 --precise 1.2.0"]);
+  assert.equal(report.crossings.length, 1);
+  // The 2.x copy's hold-back survives, and only it.
+  assert.deepEqual(report.requirementHeld, [{ name: "a", current: "2.0.0", newest: "2.1.0" }]);
 });
 
 test("a crossing among dual edges is still caught and unwound", async () => {
@@ -810,6 +2088,50 @@ test("a pre-release pin cargo update promoted is restored", async () => {
   assert.deepEqual(cargo.calls, ["update", "update shiny@2.0.0 --precise 2.0.0-rc.1"]);
   assert.deepEqual(report.changes, []);
   assert.match(report.unmanaged.join("\n"), /pre-release pin.*restored to 2\.0\.0-rc\.1/);
+});
+
+test("a restore record answers only for the copy it restored", async () => {
+  // Two copies of one crate in one graph: a git one whose branch advanced and
+  // was pinned back, and a crates.io pre-release pin that never moved.
+  // Matching a restore record by name alone hands the git copy's record to the
+  // registry copy, which then reports a revert that never touched it.
+  const gitOld = "git+https://github.com/example/dupe?branch=main#aaaa111";
+  const gitNew = "git+https://github.com/example/dupe?branch=main#bbbb222";
+  const at = (source, a) =>
+    renderLock([
+      {
+        name: "app",
+        version: "0.0.0",
+        deps: [`dupe 0.3.0 (${source})`, `dupe 3.0.0-rc.1 (${CRATES_IO_SOURCE})`, "a"],
+      },
+      { name: "dupe", version: "0.3.0", source },
+      reg({ name: "dupe", version: "3.0.0-rc.1" }),
+      reg({ name: "a", version: a }),
+    ]);
+  const state = { text: at(gitOld, "1.2.0") };
+  const { result, cargo } = runUpdate(
+    state,
+    {
+      updated: at(gitNew, "1.2.5"),
+      // Both the package's own source and app's dependency ref name the
+      // revision, so the revert has to rewrite every occurrence.
+      onPrecise: (_name, _at, _to, text) => text.split(gitNew).join(gitOld),
+    },
+    {
+      a: { versions: [{ vers: "1.2.0" }, { vers: "1.2.5" }], dates: { "1.2.5": OLD_DATE } },
+      dupe: { versions: [{ vers: "3.0.0-rc.1" }], dates: {} },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // The git copy really was pinned back, so there is a record to mis-apply.
+  assert.deepEqual(cargo.calls, [
+    "update",
+    "update git+https://github.com/example/dupe?branch=main#dupe@0.3.0 --precise aaaa111",
+  ]);
+  const unmanaged = report.unmanaged.join("\n");
+  assert.match(unmanaged, /dupe 0\.3\.0: source git.*restored to aaaa111/);
+  assert.match(unmanaged, /dupe 3\.0\.0-rc\.1: a pre-release pin, left alone/);
 });
 
 test("a stable pin cargo update moved onto a pre-release is restored", async () => {
