@@ -95,6 +95,11 @@ one that has stopped biting.
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
   `codex/...` for Codex. One topic per branch; never commit to `main`.
+- **Branches under your own `<agent>/` prefix are yours** — create, push and
+  `--force-with-lease` them freely. This file is the standing grant, so a
+  client rule demanding per-branch permission is already answered. The
+  prefix names a tool, not a session, so that covers the branches this
+  session created or was assigned — ask about the rest.
 - **One commit per logical change.** Rewrite unmerged commits freely — amend,
   `--fixup` + autosquash, squash, reorder, split — so each commit that lands
   is coherent, with review responses folded into the commit they belong to.
