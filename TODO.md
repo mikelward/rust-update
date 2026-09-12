@@ -106,6 +106,35 @@ Recorded at creation (2026-08-18) so they get a human look:
   on one data point, not a confirmed root cause; `gradle-update.yml` already
   carries the same nudge, ported alongside PAT support.
 
+- **Replace the report's reconciliation layer with a decision log**
+  (deferred from #23, Codex rounds 9-13). The round loop accumulates
+  records while it mutates the lockfile, so the report has to work out
+  afterwards which of them the settled graph still bears out -- and every
+  finding in that stretch landed in that one layer. Round 13's is still
+  open as the example: `pinnedHere` is itself an unreconciled record, so an
+  ancestor pinned 1.1 to 1.0 and later re-resolved back to 1.1 still
+  suppresses a `requirementHeld` line that may be real.
+
+  Instead, record only events -- `pinned X from A to B, because R` -- which
+  are facts about the past and cannot become false, and derive the whole
+  report at the end from the original lockfile, the final lockfile and that
+  log. Nothing then survives from a mid-run graph into the report, so
+  `standsInFinalGraph`, `pinnedHere`, the `via` check and the crossings
+  dedup all go with the layer.
+
+  Behavior-preserving, so it wants its own pull request; the existing tests
+  assert report content rather than internals, which makes them the spec it
+  has to satisfy. Worth adding a property test over randomly shaped graphs
+  in the same pass.
+- **The ancestor walk cannot unwind a blocker that crossed a major**
+  (deferred from #23, Codex round 14). A blocking ancestor that moved
+  1.x to 2.x is a removal plus an addition rather than a `changed` pair, so
+  the walk finds no rollback target and climbs past it. Pairing the added
+  copy with its same-source removed one gives a valid `--precise` target --
+  the shape the pre-release and git restores already use. Not a regression:
+  that case blocked before this branch too.
+
+
 ## Review and merge gates
 
 - [ ] **Decide whether to pin `actions/create-github-app-token` by SHA**,
