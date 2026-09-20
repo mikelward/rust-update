@@ -1788,6 +1788,114 @@ test("a crossing hidden behind a surviving old major is still unwound", async ()
   assert.equal(report.crossings[0].dragged.from, "1.4.0");
 });
 
+test("an unchanged dependent's crossing holds back the mover that dropped the anchor", async () => {
+  // The mesh windows-sys shape. `ws` sits in two compat groups: 0.61 (held by
+  // `m`, `d1`, `d2`) and 0.59 (held by `k`). `m`'s bump stops requiring 0.61,
+  // so that copy loses its last narrow referencer and cargo dedups the
+  // wide-range dependents `d1`/`d2` — which did NOT change — down onto 0.59.
+  // Their edge crosses a compat boundary with nothing in their own move to
+  // show for it. Rather than aborting the whole batch, the engine holds `m`
+  // back to where it started, which restores the 0.61 copy and lets `d1`/`d2`
+  // re-attach — and the clean update `u` still ships.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d1", "d2", "k", "m", "u"] },
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.0.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  // The bulk resolve: m drops ws, its 0.61 copy vanishes, d1/d2 dedup to 0.59,
+  // and u takes its clean bump.
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d1", "d2", "k", "m", "u"] },
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.1.0" }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+  ]);
+  // Pinning m back to 1.0.0 restores its 0.61 requirement, so cargo brings the
+  // 0.61 copy back and re-attaches the wide-range dependents; u stays bumped.
+  const healed = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d1", "d2", "k", "m", "u"] },
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: bulk, onPrecise: (name, _at, _to, text) => (name === "m" ? healed : text) },
+    {
+      d1: { versions: [{ vers: "1.0.0" }], dates: {} },
+      d2: { versions: [{ vers: "1.0.0" }], dates: {} },
+      k: { versions: [{ vers: "1.0.0" }], dates: {} },
+      m: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      u: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  // The batch is not sunk: it ships u, and holds m back.
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(report.changes, [{ name: "u", from: "1.0.0", to: "1.1.0", direct: true }]);
+  // One pin: the anchor mover, however many dependents rode along.
+  assert.deepEqual(cargo.calls, ["update", "update m@1.1.0 --precise 1.0.0"]);
+  assert.equal(report.crossings.length, 1);
+  assert.equal(report.crossings[0].name, "m");
+  assert.equal(report.crossings[0].from, "1.0.0");
+  assert.deepEqual(report.crossings[0].dragged, { name: "ws", from: "0.61.2", to: "0.59.0" });
+  assert.match(reportMarkdown(report), /## Held back — would drag a transitive major/);
+  assert.match(reportMarkdown(report), /`m` stays at 1\.0\.0: 1\.1\.0 moves `ws` from 0\.61\.2 to 0\.59\.0/);
+});
+
+test("an unchanged dependent's crossing still blocks when no changed package dropped the anchor", async () => {
+  // The fail-loud boundary. Here the anchor was held by `r`, which a bumped
+  // `p` dropped indirectly (p stopped depending on r, so r was removed
+  // outright) — not by any changed package's own edge to `ws`. A removed
+  // package has no version to hold back to, and the surgical pin-back only
+  // reaches a changed package whose OWN edge to the dragged crate vanished, so
+  // there is nothing safe to hold back and the batch fails loudly rather than
+  // shipping a crossing.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d1", "k", "p"] },
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "p", version: "1.0.0", deps: ["r"] }),
+    reg({ name: "r", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d1", "k", "p"] },
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "p", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+  ]);
+  const state = { text: before };
+  const { result } = runUpdate(
+    state,
+    { updated: bulk },
+    {
+      d1: { versions: [{ vers: "1.0.0" }], dates: {} },
+      k: { versions: [{ vers: "1.0.0" }], dates: {} },
+      p: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /did not itself change/);
+  assert.match(report.blocking[0], /no updated package in this batch dropped an edge to ws/);
+});
+
 test("a mover this run pinned back is not blamed on the manifest requirement", async () => {
   // a is held back because its 1.3.0 would drag b across a major — this
   // engine's own decision, already printed under the crossings. Attributing

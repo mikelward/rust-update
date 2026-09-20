@@ -29,7 +29,14 @@
 //     (Cargo's caret rule: new major, or new minor at 0.x) with nothing in
 //     any manifest to show for it. The dependent that dragged it is pinned
 //     back to where it started; even a transitive breaking move is a
-//     deliberate migration, not a weekly batch.
+//     deliberate migration, not a weekly batch. The same crossing can also
+//     surface on a dependent that did NOT change: when a bumped crate stops
+//     requiring the group a shared transitive sat in, that copy loses its
+//     last referencer and cargo dedups the wide-range dependents down onto a
+//     surviving incompatible copy. The mover whose bump dropped the anchor is
+//     pinned back — holding one package back rather than aborting the batch,
+//     the way the npm sibling holds back a blocked package instead of sinking
+//     the week's whole update.
 //
 // A violation neither pinning strategy can fix fails the run LOUDLY with the
 // lockfile restored: a red weekly run costs a rerun (the cooldown case heals
@@ -1233,12 +1240,22 @@ export const updateLockfile = async ({
       }
       return byName;
     };
+    // Edge groups are read for every pair, and again for every changed
+    // package when an unchanged dependent's crossing hunts its anchor mover
+    // (below). Memoize per (side, package): a repeat call would recompute
+    // the same groups and re-push the same block on an unresolvable ref.
+    const edgeGroupsCache = new Map();
+    const edgesOf = (pkg, packages, side) => {
+      const key = `${side}:${idOf(pkg)}`;
+      if (!edgeGroupsCache.has(key)) edgeGroupsCache.set(key, edgeGroups(pkg, packages));
+      return edgeGroupsCache.get(key);
+    };
     // One pin per mover, however many of its edges crossed — asking twice
     // would trip pin()'s repeat guard on a batch that only needs one pin.
     const moverPins = new Map();
     for (const pair of pairs) {
-      const before = edgeGroups(pair.before, oldLock.packages);
-      const after = edgeGroups(pair.after, newLock.packages);
+      const before = edgesOf(pair.before, oldLock.packages, "old");
+      const after = edgesOf(pair.after, newLock.packages, "new");
       for (const [name, beforeGroups] of before) {
         const afterGroups = after.get(name);
         if (afterGroups === undefined) continue; // every edge to this name dropped
@@ -1251,9 +1268,48 @@ export const updateLockfile = async ({
           `${pair.after.name}'s edge to ${name} would cross from ${was} ` +
           `to ${now} — a semver-incompatible move`;
         if (pair.change === null) {
-          block(
-            `${crossing}, on a package that did not itself change — not something cargo update produces`,
-          );
+          // The dependent did not itself change, so cargo consolidated its
+          // edge onto a surviving copy after the compatibility group it used
+          // lost its last referencer — the anchor. Some CHANGED package's
+          // bump dropped an edge to `name` in exactly that lost group; pinning
+          // that mover back restores the copy and un-crosses this dependent,
+          // which is the per-package hold-back — the mover is held back, the
+          // dependent rides along. (mesh's windows-sys 0.61 case: a bumped
+          // crate stopped requiring 0.61, so its copy vanished and the
+          // wide-range dependents deduped down onto 0.59.) Only a mover this
+          // batch changed can be pinned back to a version it moved from; if
+          // the anchor was dropped by a package removed outright, or none is
+          // found, there is nothing to hold back and the batch blocks — the
+          // fail-loud case the incremental sibling keeps too.
+          const anchorMovers = diff.changed.filter((c) => {
+            const beforeEdges = edgesOf(c.before, oldLock.packages, "old").get(name);
+            const afterEdges = edgesOf(c.after, newLock.packages, "new").get(name);
+            return lost.some((k) => Boolean(beforeEdges?.has(k)) && !afterEdges?.has(k));
+          });
+          if (anchorMovers.length === 0) {
+            block(
+              `${crossing}, on a package that did not itself change, and no updated ` +
+                `package in this batch dropped an edge to ${name} ${was} to unwind it — ` +
+                "not something cargo update produces",
+            );
+            continue;
+          }
+          for (const c of anchorMovers) {
+            crossings.push({
+              source: sourceIdentityOf(c.after.source),
+              name: c.name,
+              from: c.from,
+              to: c.to,
+              dragged: { name, from: was, to: now },
+            });
+            moverPins.set(idOf(c.after), {
+              pkg: c.after,
+              to: c.from,
+              why:
+                `${c.name} ${c.from} → ${c.to} drops the ${name} ${was} anchor, ` +
+                `forcing ${pair.after.name}'s edge across to ${now}`,
+            });
+          }
           continue;
         }
         crossings.push({

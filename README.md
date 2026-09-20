@@ -21,8 +21,15 @@ consumer's required checks pass.
   it for anything a manifest names; where a changed dependency's own new
   requirement would drag one of ITS dependencies across (the transitive major
   npm-update walks its lockfile for), the engine pins the dependent back to
-  where it started and reports why. The newest major of each direct
-  dependency is *reported* in the PR body under "Held back", never taken.
+  where it started and reports why. The same crossing can land on a dependent
+  that did *not* change — a bumped crate stops requiring the compatibility
+  group a shared transitive sat in, that copy loses its last referencer, and
+  cargo dedups the wide-range dependents down onto a surviving incompatible
+  copy — and there the engine holds back the mover whose bump dropped the
+  anchor, so one package waits rather than the whole batch aborting (the npm
+  sibling's hold-back, by pin-back rather than an incremental rebuild). The
+  newest major of each direct dependency is *reported* in the PR body under
+  "Held back", never taken.
 - **`Cargo.toml` is never touched.** Requirements are ranges and the lockfile
   is what pins, so the batch is a lockfile refresh — the npm shape, not the
   Gradle one. A newer compatible release the manifest's requirement excludes
