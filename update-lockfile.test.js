@@ -97,13 +97,19 @@ const makeFetcher = (crates) => {
 // `--precise` rewrites one package's version in place (checksum too, as the
 // real one does). `refuse` lets a test model the resolver rejecting a pin;
 // `onPrecise` lets one model a pin that reshapes the graph.
-const makeCargo = (state, { updated, refuse, onPrecise } = {}) => {
+const makeCargo = (state, { updated, refuse, onPrecise, onMetadata } = {}) => {
   const calls = [];
   const runCargo = (args) => {
     calls.push(args.join(" "));
     if (args.length === 1 && args[0] === "update") {
       state.text = updated;
       return { ok: true, output: "" };
+    }
+    if (args[0] === "metadata") {
+      // The restore validator: cargo re-checks that the surgically-restored
+      // lockfile is still a resolution it would produce. A test decides the
+      // verdict against the current text; the default accepts.
+      return onMetadata ? onMetadata(state.text) : { ok: true, output: "" };
     }
     if (args[0] === "update" && args[2] === "--precise") {
       const spec = args[1];
@@ -149,6 +155,9 @@ const runUpdate = (state, cargoOpts, crates, opts = {}) => {
   const net = makeFetcher(crates);
   const result = updateLockfile({
     readLockfile: () => state.text,
+    writeLockfile: (text) => {
+      state.text = text;
+    },
     runCargo: cargo.runCargo,
     fetcher: net.fetcher,
     now: NOW,
@@ -1894,6 +1903,238 @@ test("an unchanged dependent's crossing still blocks when no changed package dro
   assert.equal(report.blocking.length, 1);
   assert.match(report.blocking[0], /did not itself change/);
   assert.match(report.blocking[0], /no updated package in this batch dropped an edge to ws/);
+});
+
+test("a self-inflicted crossing onto a surviving copy is restored to the baseline and ships", async () => {
+  // mesh's 09-19 shape. `d1`/`d2` sit on ws 0.61.2, which `m` also holds. `c`
+  // bumps but is inside the cooldown, so it is pinned back; that
+  // `cargo update c --precise` re-runs the resolver and slides the unchanged
+  // wide-range dependents onto the 0.59.0 copy `k` keeps — while 0.61.2 never
+  // vanishes. No changed package dropped the anchor, so there is nothing to
+  // pin back, but the copy still stands: the engine puts d1/d2's edge back to
+  // 0.61.2 after the loop and `cargo metadata --locked` accepts it. The batch
+  // ships `u`, the shipped lockfile carries no crossing, and the restore is
+  // invisible in the report because those edges now match HEAD.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "d2", "k", "m", "u"] },
+    reg({ name: "c", version: "1.0.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.0.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "d2", "k", "m", "u"] },
+    reg({ name: "c", version: "1.1.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  // The cooldown pin-back of c re-resolves and slides d1/d2 onto 0.59.0.
+  const pinned = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "d2", "k", "m", "u"] },
+    reg({ name: "c", version: "1.0.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "d2", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: bulk, onPrecise: (name, _at, _to, text) => (name === "c" ? pinned : text) },
+    {
+      c: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": FRESH_DATE } },
+      d1: { versions: [{ vers: "1.0.0" }], dates: {} },
+      d2: { versions: [{ vers: "1.0.0" }], dates: {} },
+      k: { versions: [{ vers: "1.0.0" }], dates: {} },
+      m: { versions: [{ vers: "1.0.0" }], dates: {} },
+      u: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.deepEqual(report.changes, [{ name: "u", from: "1.0.0", to: "1.1.0", direct: true }]);
+  // The restore actually happened: cargo was asked to validate it, and the
+  // shipped lockfile has d1/d2 back on 0.61.2 (HEAD), with fd-lock's... k's
+  // 0.59.0 untouched.
+  assert.ok(cargo.calls.includes("metadata --format-version 1 --locked"), cargo.calls.join(" | "));
+  const edges = (dep) =>
+    parseLockfile(state.text)
+      .packages.find((p) => p.name === dep)
+      .dependencies.filter((r) => r.startsWith("ws"));
+  assert.deepEqual(edges("d1"), ["ws 0.61.2"]);
+  assert.deepEqual(edges("d2"), ["ws 0.61.2"]);
+  assert.deepEqual(edges("k"), ["ws 0.59.0"]);
+});
+
+test("a restore cargo rejects blocks as a real transitive major", async () => {
+  // Same shape, but the edge was not a re-dedup: a feature change genuinely
+  // pulls the new major, so putting it back leaves a lockfile cargo will not
+  // accept. `cargo metadata --locked` says so, and the batch blocks rather
+  // than shipping the transitive major behind a surviving old copy.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "k", "m", "u"] },
+    reg({ name: "c", version: "1.0.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.0.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "k", "m", "u"] },
+    reg({ name: "c", version: "1.1.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const pinned = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d1", "k", "m", "u"] },
+    reg({ name: "c", version: "1.0.0" }),
+    reg({ name: "d1", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const state = { text: before };
+  const { result } = runUpdate(
+    state,
+    {
+      updated: bulk,
+      onPrecise: (name, _at, _to, text) => (name === "c" ? pinned : text),
+      // cargo refuses the restored lockfile: d1 genuinely needs ws 0.59.0 now.
+      onMetadata: () => ({ ok: false, output: "error: the lock file needs to be updated but --locked was passed" }),
+    },
+    {
+      c: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": FRESH_DATE } },
+      d1: { versions: [{ vers: "1.0.0" }], dates: {} },
+      k: { versions: [{ vers: "1.0.0" }], dates: {} },
+      m: { versions: [{ vers: "1.0.0" }], dates: {} },
+      u: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+    },
+  );
+  const report = await result;
+  assert.equal(report.blocking.length, 1);
+  assert.match(report.blocking[0], /forced rather than a re-dedup|cargo rejects/);
+});
+
+test("a surviving group is restored, not pinned, when a changed package also dropped its edge", async () => {
+  // Survival is judged before the anchor-mover hunt. `c` (a clean update that
+  // should ship) drops its own edge to ws 0.61.2 while `m` still holds it, and
+  // the unchanged `d` re-dedups off 0.61.2 onto 0.59.0. Because 0.61.2 still
+  // stands, restoring d's edge is enough — c must NOT be pinned back. The old
+  // code reached the anchor-mover path (c dropped an edge to a lost group) and
+  // pinned c, holding its update for nothing.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d", "k", "m"] },
+    reg({ name: "c", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "d", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  // The bulk resolve: c bumps and stops requiring ws entirely; d slides onto
+  // 0.59.0 though m keeps 0.61.2 alive.
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["c", "d", "k", "m"] },
+    reg({ name: "c", version: "1.1.0" }),
+    reg({ name: "d", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "k", version: "1.0.0", deps: ["ws 0.59.0"] }),
+    reg({ name: "m", version: "1.0.0", deps: ["ws 0.61.2"] }),
+    reg({ name: "ws", version: "0.59.0" }),
+    reg({ name: "ws", version: "0.61.2" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: bulk },
+    {
+      c: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      d: { versions: [{ vers: "1.0.0" }], dates: {} },
+      k: { versions: [{ vers: "1.0.0" }], dates: {} },
+      m: { versions: [{ vers: "1.0.0" }], dates: {} },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  // c ships — it was not pinned back to hold its update.
+  assert.deepEqual(report.changes, [{ name: "c", from: "1.0.0", to: "1.1.0", direct: true }]);
+  assert.ok(
+    !cargo.calls.some((call) => call.includes("--precise")),
+    `no pin expected, saw: ${cargo.calls.join(" | ")}`,
+  );
+  // d's edge was restored to the surviving 0.61.2 copy.
+  const edges = (dep) =>
+    parseLockfile(state.text)
+      .packages.find((p) => p.name === dep)
+      .dependencies.filter((r) => r.startsWith("ws"));
+  assert.deepEqual(edges("d"), ["ws 0.61.2"]);
+});
+
+test("a restore targets the surviving copy, not a baseline version that moved in range", async () => {
+  // The compat group HEAD's edge resolved to survives, but the copy in it moved
+  // within range: HEAD had a single `foo 1.1.0` (referenced as the bare
+  // "foo"), and the bulk resolve bumped it to 1.2.0 for `o` while sliding the
+  // unchanged `d` across to `foo 2.0.0`. Restoring HEAD's verbatim "foo" would
+  // be ambiguous (two foos now) and name no 1.1.0 copy, so cargo would reject a
+  // safe batch. The restore must target the surviving 1.x copy — foo 1.2.0 —
+  // using the reference the shipped tree already carries for it.
+  const before = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d", "o", "u"] },
+    reg({ name: "d", version: "1.0.0", deps: ["foo"] }),
+    reg({ name: "o", version: "1.0.0", deps: ["foo"] }),
+    reg({ name: "u", version: "1.0.0" }),
+    reg({ name: "foo", version: "1.1.0" }),
+  ]);
+  const bulk = renderLock([
+    { name: "app", version: "0.0.0", deps: ["d", "o", "u"] },
+    reg({ name: "d", version: "1.0.0", deps: ["foo 2.0.0"] }),
+    reg({ name: "o", version: "1.0.0", deps: ["foo 1.2.0"] }),
+    reg({ name: "u", version: "1.1.0" }),
+    reg({ name: "foo", version: "1.2.0" }),
+    reg({ name: "foo", version: "2.0.0" }),
+  ]);
+  const state = { text: before };
+  const { result, cargo } = runUpdate(
+    state,
+    { updated: bulk },
+    {
+      d: { versions: [{ vers: "1.0.0" }], dates: {} },
+      o: { versions: [{ vers: "1.0.0" }], dates: {} },
+      u: { versions: [{ vers: "1.0.0" }, { vers: "1.1.0" }], dates: { "1.1.0": OLD_DATE } },
+      foo: {
+        versions: [{ vers: "1.1.0" }, { vers: "1.2.0" }, { vers: "2.0.0" }],
+        dates: { "1.2.0": OLD_DATE, "2.0.0": OLD_DATE },
+      },
+    },
+  );
+  const report = await result;
+  assert.deepEqual(report.blocking, []);
+  assert.ok(cargo.calls.includes("metadata --format-version 1 --locked"), cargo.calls.join(" | "));
+  // d's edge is restored to the surviving copy foo 1.2.0 — not the absent
+  // baseline "foo"/1.1.0.
+  const dEdges = parseLockfile(state.text)
+    .packages.find((p) => p.name === "d")
+    .dependencies.filter((r) => r.startsWith("foo"));
+  assert.deepEqual(dEdges, ["foo 1.2.0"]);
 });
 
 test("a mover this run pinned back is not blamed on the manifest requirement", async () => {

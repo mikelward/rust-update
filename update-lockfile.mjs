@@ -442,6 +442,16 @@ export const compatKeyOf = (v) => {
   return `0.0.${p.patch}`;
 };
 
+// The compatibility slot a package occupies, as the edge-group diff keys it:
+// a sourceless (workspace/path) package by its exact version, since caret
+// semantics don't apply there, otherwise its source identity plus its
+// caret-compat key. `edgeGroups`, the survival test, and the post-loop restore
+// all ask "same slot?" through this one function so they cannot drift.
+export const compatSlotOf = (p) =>
+  p.source === null
+    ? `=${p.version}`
+    : `${compatKeyOf(p.version)}\n${sourceIdentityOf(p.source)}`;
+
 // The compatibility SLOT a crate's version occupies: the crate plus the compat
 // group that version falls in. `idOf` identifies a package and `crateOf` the
 // crate; this identifies what the report's final pass ITERATES -- one package
@@ -721,16 +731,52 @@ export const blockersFrom = (output) =>
     ([, name, version]) => ({ name, version }),
   );
 
+// Rewrites specific dependency references in the lockfile TEXT: within the
+// `[[package]]` block at each edit's `line` (the 1-indexed header line the
+// parser records), the one entry ` "<fromRef>",` becomes ` "<toRef>",`. Text
+// surgery rather than a re-render so cargo's formatting is preserved exactly
+// and only the named edges move; `cargo metadata --locked` then validates the
+// result. Throws if an edge is not found where it was recorded, since a
+// silent miss would ship the crossing this exists to undo.
+export const restoreLockfileEdges = (text, edits) => {
+  const lines = text.split("\n");
+  for (const { line, fromRef, toRef } of edits) {
+    let inDeps = false;
+    let done = false;
+    for (let i = line; i < lines.length; i++) {
+      const l = lines[i];
+      if (!inDeps && /^\[/.test(l)) break; // next section reached without the array
+      if (l === "dependencies = [") {
+        inDeps = true;
+        continue;
+      }
+      if (inDeps) {
+        if (l === "]") break;
+        if (l === ` "${fromRef}",`) {
+          lines[i] = ` "${toRef}",`;
+          done = true;
+          break;
+        }
+      }
+    }
+    if (!done) {
+      throw new Error(`restore: edge "${fromRef}" not found in the package block at line ${line}`);
+    }
+  }
+  return lines.join("\n");
+};
+
 // Runs `cargo update`, then enforces the cooldown and the no-transitive-
 // majors rule by pinning offenders back, then derives the report. Effects
 // are injected: `readLockfile` returns the current lockfile text,
-// `runCargo(args)` runs cargo and returns { ok, output }, `fetcher` speaks
-// HTTPS, `now` is the clock. Throws on an unparseable lockfile or a failed
-// plain `cargo update`; policy violations that survive the fix-up loop land
-// in the returned `blocking` list, and the CLI restores the lockfile and
-// fails the run on them.
+// `writeLockfile(text)` overwrites it, `runCargo(args)` runs cargo and returns
+// { ok, output }, `fetcher` speaks HTTPS, `now` is the clock. Throws on an
+// unparseable lockfile or a failed plain `cargo update`; policy violations
+// that survive the fix-up loop land in the returned `blocking` list, and the
+// CLI restores the lockfile and fails the run on them.
 export const updateLockfile = async ({
   readLockfile,
+  writeLockfile,
   runCargo,
   fetcher,
   now = new Date(),
@@ -785,6 +831,11 @@ export const updateLockfile = async ({
   const cooldown = [];
   const crossings = [];
   const restored = [];
+  // Unchanged dependents whose edge to a transitive this run's own fix-ups
+  // deduped onto another in-range copy, while the copy it left still stands.
+  // Keyed `${idOf(dep)}\n${transitive}`; its edge is put back to HEAD's copy
+  // after the loop and cargo validates the result. See the post-loop restore.
+  const edgeRestores = new Map();
   const blocking = [];
   // Every compatibility slot (see `slotOf`) whose version in the finished
   // lockfile is THIS RUN's choice rather than the resolver's: a crossing mover
@@ -1223,10 +1274,7 @@ export const updateLockfile = async ({
         // Keyed as in the lockfile diff: dual edges to one crate from two
         // different sources — or to two compatible versions of a renamed
         // path dependency — are a valid graph, not a duplicate.
-        const key =
-          target.source === null
-            ? `=${target.version}`
-            : `${compatKeyOf(target.version)}\n${sourceIdentityOf(target.source)}`;
+        const key = compatSlotOf(target);
         if (!byName.has(target.name)) byName.set(target.name, new Map());
         const groups = byName.get(target.name);
         if (groups.has(key) && groups.get(key) !== target) {
@@ -1269,22 +1317,44 @@ export const updateLockfile = async ({
           `to ${now} — a semver-incompatible move`;
         if (pair.change === null) {
           // The dependent did not itself change, so cargo consolidated its
-          // edge onto a surviving copy after the compatibility group it used
-          // lost its last referencer — the anchor. Some CHANGED package's
-          // bump dropped an edge to `name` in exactly that lost group; pinning
-          // that mover back restores the copy and un-crosses this dependent,
-          // which is the per-package hold-back — the mover is held back, the
-          // dependent rides along. (mesh's windows-sys 0.61 case: a bumped
-          // crate stopped requiring 0.61, so its copy vanished and the
-          // wide-range dependents deduped down onto 0.59.) Only a mover this
-          // batch changed can be pinned back to a version it moved from; if
-          // the anchor was dropped by a package removed outright, or none is
-          // found, there is nothing to hold back and the batch blocks — the
-          // fail-loud case the incremental sibling keeps too.
+          // edge onto a surviving copy. Which fix depends on whether the copy
+          // it left still exists, so ask that FIRST — before hunting an anchor
+          // mover — since a still-present group must not send an unrelated
+          // update to the hold-back path merely because some changed package
+          // also happened to drop its own edge to it.
+          //
+          // (a) EVERY compat group this edge left still stands in the shipped
+          // tree — another dependent keeps it — so nothing vanished: cargo
+          // merely re-deduped this unchanged dependent onto an in-range copy
+          // its requirement already admits, typically because THIS run's own
+          // cooldown pin-back re-ran the resolver (mesh's windows-sys 0.61.2,
+          // kept alive by `mio`, while holding `rustix` back slid
+          // errno/nu-ansi-term/rustix onto the 0.59.0 copy `fd-lock` keeps).
+          // Record the dependent; its edge is put back to the surviving copy
+          // after the loop and cargo validates the result, so nothing here has
+          // to reason about whether the move was benign.
+          const vanished = lost.filter(
+            (k) => !newLock.packages.some((p) => p.name === name && compatSlotOf(p) === k),
+          );
+          if (vanished.length === 0) {
+            edgeRestores.set(`${idOf(pair.after)}\n${name}`, { dep: pair.after, name });
+            continue;
+          }
+          // (b) A group genuinely vanished — its last referencer, the anchor,
+          // was a CHANGED package whose bump dropped that edge to `name`.
+          // Pinning that mover back restores the copy and un-crosses this
+          // dependent, which is the per-package hold-back — the mover is held
+          // back, the dependent rides along. The hunt targets the VANISHED
+          // groups specifically: a survivor another package still keeps is no
+          // reason to pin. Only a mover this batch changed can be pinned back
+          // to a version it moved from; if the anchor went with a package
+          // removed outright, or none is found, there is nothing to hold back
+          // and the batch blocks — the fail-loud case the incremental sibling
+          // keeps too.
           const anchorMovers = diff.changed.filter((c) => {
             const beforeEdges = edgesOf(c.before, oldLock.packages, "old").get(name);
             const afterEdges = edgesOf(c.after, newLock.packages, "new").get(name);
-            return lost.some((k) => Boolean(beforeEdges?.has(k)) && !afterEdges?.has(k));
+            return vanished.some((k) => Boolean(beforeEdges?.has(k)) && !afterEdges?.has(k));
           });
           if (anchorMovers.length === 0) {
             block(
@@ -1461,6 +1531,112 @@ export const updateLockfile = async ({
     }
     newText = readLockfile();
     newLock = parseLockfile(newText);
+  }
+
+  // Put back any self-inflicted, unwindable crossing recorded above: an
+  // unchanged dependent's edge that this run's own fix-ups deduped onto
+  // another in-range copy while the copy it left still stands. Rather than
+  // reason about whether the move is benign, restore the edge to the surviving
+  // copy of the compat group HEAD resolved and let cargo be the judge. A
+  // legitimate re-dedup (the dependent's own requirement admits both versions)
+  // reproduces HEAD's topology and `cargo metadata --locked` accepts it; a
+  // move actually forced by something else — a feature change pulling in a new
+  // major — cannot be put back, so cargo reports the lockfile out of date and
+  // the batch blocks. No trust in the dependent's source or manifest is needed
+  // here, which is why the clean-context validator needs no matching
+  // exception: the shipped lockfile simply carries no crossing.
+  if (edgeRestores.size > 0 && blocking.length === 0) {
+    const refsTo = (pkg, name) =>
+      (pkg.dependencies ?? []).filter((r) => (parseDepRef(r) ?? {}).name === name);
+    // The reference string the shipped lockfile already uses for `pkg`. Cargo
+    // renders a dependency reference at exactly the disambiguation the whole
+    // lockfile needs — bare name, name+version, or name+version+source — and
+    // every referrer of one package writes it identically, so reusing an
+    // existing referrer's string restores an edge in cargo's own format
+    // without re-deriving that rule and risking a form `--locked` rejects.
+    // null when nothing references it, which a standing copy always is, so the
+    // caller fails closed rather than invent one.
+    const referenceTo = (pkg) => {
+      for (const p of newLock.packages) {
+        for (const ref of p.dependencies ?? []) {
+          if (parseDepRef(ref)?.name !== pkg.name) continue;
+          const resolved = resolveDepRef(newLock.packages, ref);
+          if (resolved.length === 1 && idOf(resolved[0]) === idOf(pkg)) return ref;
+        }
+      }
+      return null;
+    };
+    const edits = [];
+    for (const { dep, name } of edgeRestores.values()) {
+      const now = newLock.packages.find((p) => idOf(p) === idOf(dep));
+      const head = oldLock.packages.find((p) => idOf(p) === idOf(dep));
+      if (now === undefined || head === undefined) continue; // the dependent moved after all
+      const nowRefs = refsTo(now, name);
+      const headRefs = refsTo(head, name);
+      // A single edge to `name` is the shape a dedup shuffle takes; more than
+      // one (renamed dual edges to the same crate crossing at once) has no
+      // unambiguous baseline to map to, so it fails closed rather than guess.
+      if (nowRefs.length !== 1 || headRefs.length !== 1) {
+        blocking.push(
+          `cannot restore ${dep.name} ${dep.version}'s edge to ${name} to its baseline: ` +
+            `${headRefs.length} baseline edge(s) and ${nowRefs.length} now — refusing to guess`,
+        );
+        continue;
+      }
+      // Restore to the copy that STILL STANDS in the compat group HEAD's edge
+      // resolved to — not HEAD's reference verbatim. The group's package can
+      // itself have moved within range (HEAD `foo 1.1`, the shipped tree keeps
+      // `foo 1.2` through another dependent), so HEAD's string can name an
+      // absent version; writing it would make `--locked` reject a safe batch.
+      const headTarget = resolveDepRef(oldLock.packages, headRefs[0]);
+      if (headTarget.length !== 1) {
+        blocking.push(
+          `cannot restore ${dep.name} ${dep.version}'s edge to ${name}: its baseline ` +
+            `reference "${headRefs[0]}" does not resolve to a single package`,
+        );
+        continue;
+      }
+      const slot = compatSlotOf(headTarget[0]);
+      const survivors = newLock.packages.filter((p) => p.name === name && compatSlotOf(p) === slot);
+      if (survivors.length !== 1) {
+        blocking.push(
+          `cannot restore ${dep.name} ${dep.version}'s edge to ${name}: the baseline copy's ` +
+            `compatibility group has ${survivors.length} copies in the shipped tree`,
+        );
+        continue;
+      }
+      const toRef = referenceTo(survivors[0]);
+      if (toRef === null) {
+        blocking.push(
+          `cannot restore ${dep.name} ${dep.version}'s edge to ${name}: no reference to the ` +
+            "surviving copy exists in the shipped tree",
+        );
+        continue;
+      }
+      if (nowRefs[0] === toRef) continue; // a later round already put it back
+      edits.push({ line: now.line, fromRef: nowRefs[0], toRef });
+    }
+    if (blocking.length === 0 && edits.length > 0) {
+      newText = restoreLockfileEdges(newText, edits);
+      writeLockfile(newText);
+      const check = runCargo(["metadata", "--format-version", "1", "--locked"]);
+      if (!check.ok) {
+        blocking.push(
+          "restoring an unchanged dependent's edge to its baseline copy left a " +
+            "lockfile cargo rejects, so the move was forced rather than a re-dedup — " +
+            `a transitive major to migrate deliberately:\n${check.output}`,
+        );
+      } else {
+        newLock = parseLockfile(newText);
+        if (newLock.errors.length > 0) {
+          throw new Error(`the restored lockfile does not parse:\n${newLock.errors.join("\n")}`);
+        }
+        diff = diffLockfiles(oldLock, newLock);
+        if (diff.errors.length > 0) {
+          throw new Error(`lockfile diff refused after restore:\n${diff.errors.join("\n")}`);
+        }
+      }
+    }
   }
 
   // A non-crates.io package appearing or vanishing outright has no pin to
@@ -1802,6 +1978,7 @@ const main = async () => {
   const args = parseArgs(process.argv.slice(2));
   const dir = dirname(args.lockfile) || ".";
   const readLockfile = () => readFileSync(args.lockfile, "utf8");
+  const writeLockfile = (text) => writeFileSync(args.lockfile, text);
   const runCargo = (cargoArgs) => {
     try {
       // Both streams captured: cargo reports to stderr, and a failure's
@@ -1822,6 +1999,7 @@ const main = async () => {
   try {
     report = await updateLockfile({
       readLockfile,
+      writeLockfile,
       runCargo,
       fetcher: httpsFetcher,
       cooldownDays: args.cooldownDays,
