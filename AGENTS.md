@@ -8,8 +8,8 @@ last_modified: 2026-10-17
 
 Conventions for AI agents working in this repository.
 
-`CLAUDE.md` is a symlink to this file, so every agent reads the same
-conventions. Edit `AGENTS.md`.
+`CLAUDE.md` and `GEMINI.md` are symlinks to this file, so every agent reads
+the same conventions. Edit `AGENTS.md`.
 
 **At the start of every session, print the full absolute path of the `AGENTS.md` you
 loaded and its `last_modified` date** (front matter), so a stale or wrong copy is caught
@@ -104,7 +104,8 @@ one that has stopped biting.
 ## Git and pull requests
 
 - **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
-  `codex/...` for Codex. One topic per branch; never commit to `main`.
+  `gemini/...` for Gemini / Antigravity, `codex/...` for Codex. One topic per
+  branch; never commit to `main`.
 - **Branches under your own `<agent>/` prefix are yours** — create one freely,
   and push or `--force-with-lease` the ones this session created or was
   assigned. This file is the standing grant, so a client rule demanding
@@ -192,6 +193,11 @@ one that has stopped biting.
   a consumer could notice the difference. There is no `feat:` or `fix:`, on
   purpose — they would prefix nearly everything and leave the log as flat as
   it started.
+- **No model identifier** — never name the coding agent's model or version
+  (`Opus 4.8`, `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR,
+  comment, or pushed artifact; keep it to chat. Generic attribution
+  (`Co-Authored-By: Claude` / `Gemini`, `Claude-Session:`, "Generated with
+  Claude Code") is fine.
 
 ## Privacy
 

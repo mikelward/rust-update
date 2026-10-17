@@ -6,7 +6,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { lstatSync, readFileSync, readlinkSync } from "node:fs";
 
 const text = readFileSync(new URL("./AGENTS.md", import.meta.url), "utf8");
 const match = text.match(/^---\n([\s\S]*?)\n---\n/);
@@ -41,3 +41,14 @@ test("front matter marks the guide always on", () => {
 test("front matter carries a last_modified date", () => {
   assert.match(fields.last_modified ?? "", /^\d{4}-\d{2}-\d{2}$/);
 });
+
+// Claude Code reads CLAUDE.md and Gemini / Antigravity read GEMINI.md; each
+// must stay a symlink to AGENTS.md, or that client loses the shared rules
+// while every test above, which reads AGENTS.md directly, still passes.
+for (const name of ["CLAUDE.md", "GEMINI.md"]) {
+  test(`${name} is a symlink to AGENTS.md`, () => {
+    const file = new URL(`./${name}`, import.meta.url);
+    assert.ok(lstatSync(file).isSymbolicLink(), `${name} must be a symlink`);
+    assert.equal(readlinkSync(file), "AGENTS.md");
+  });
+}
